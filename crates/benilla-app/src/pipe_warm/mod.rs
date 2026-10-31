@@ -346,8 +346,15 @@ fn run_warm_pass(
         despawn_rigs(&mut commands, &rigs);
         return;
     }
-    // No menagerie in a capture.
-    if benilla_world::dev_state::deterministic_run() {
+    // Skip warm pass if opted out, or on Windows by default unless WOW_PIPE_WARM=1
+    // (pipe_warm compiles 2,060 pipeline variants behind the cover, intended for macOS where
+    // Bevy compiles synchronously on the render thread. On Windows, shader compilation is async,
+    // and when running on WARP or low-end GPUs, compiling and drawing 2,060 variants causes
+    // multi-second hitches that trigger DXGI_ERROR_DEVICE_REMOVED).
+    if std::env::var_os("WOW_NO_PIPE_WARM").is_some()
+        || (cfg!(target_os = "windows") && std::env::var_os("WOW_PIPE_WARM").is_none())
+        || benilla_world::dev_state::deterministic_run()
+    {
         warm.done = true;
         return;
     }

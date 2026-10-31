@@ -132,7 +132,15 @@ pub(super) fn spawn_loaded_placements(
     let count_cap = if focus.paced {
         SPAWN_COUNT_CAP
     } else {
-        usize::MAX
+        match std::env::var("WOW_SPAWN_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(cap) => cap,
+            None => {
+                #[cfg(target_os = "windows")]
+                { usize::MAX }
+                #[cfg(not(target_os = "windows"))]
+                { usize::MAX }
+            }
+        }
     };
     let mut spawned_n = 0usize;
     // The anim clock origin: each instance's phase is its spawn time, as in the reference.

@@ -20,7 +20,7 @@ use benilla_world::world_map::CurrentMap;
 use benilla_world::world_point::WorldPoint;
 
 use super::enemies::Enemy;
-use super::hero::Hero;
+use super::hero::{Hero, PartyHero};
 use super::hud::UiArt;
 use super::Run;
 use crate::area::AreaTableRes;
@@ -352,7 +352,7 @@ pub(super) fn zone_text(
     }
 }
 
-/// Recomposite the map around the hero: tiles, mask, arrow, then the enemy dots.
+/// Recomposite the map around the hero: tiles, mask, arrow, then the enemy dots and party blips.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compose(
     mut map: ResMut<MiniMap>,
@@ -360,7 +360,9 @@ pub(super) fn compose(
     catalog: Option<Res<MapCatalogRes>>,
     current: Option<Res<CurrentMap>>,
     phase: Res<State<super::Phase>>,
+    run: Res<Run>,
     hero: Query<&Transform, With<Hero>>,
+    party: Query<(&Transform, &PartyHero), Without<Hero>>,
     enemies: Query<(&Transform, &Enemy)>,
     mut images: ResMut<Assets<Image>>,
     time: Res<Time<Real>>,
@@ -528,6 +530,32 @@ pub(super) fn compose(
                 Some(icons.sample(x, y))
             });
         }
+    }
+    // Party member blips on the minimap (cyan/gold circle, red when downed).
+    let party_size = 10.0 * scale;
+    for (tf, ph) in &party {
+        let off = Vec2::new(tf.translation.x - p.x, tf.translation.z - p.z);
+        let clamped_off = if off.length() > radius * 0.92 {
+            off.normalize_or_zero() * (radius * 0.92)
+        } else {
+            off
+        };
+        let downed = run.player(ph.id).is_some_and(|c| c.is_down());
+        let fill_rgb = if downed {
+            [255.0, 60.0, 60.0]
+        } else {
+            [80.0, 210.0, 255.0]
+        };
+        blit(buf, center + clamped_off / yd_per_px, party_size, |q| {
+            let r = q.length() / (party_size * 0.5);
+            if r > 1.0 {
+                None
+            } else if r > 0.72 {
+                Some([15.0, 15.0, 20.0, 240.0])
+            } else {
+                Some([fill_rgb[0], fill_rgb[1], fill_rgb[2], 255.0])
+            }
+        });
     }
 
     if let Some(image) = images.get_mut(&map.image) {

@@ -4,7 +4,8 @@
 use bevy::prelude::*;
 
 use super::enemies::Enemy;
-use super::hero::{self, Hero};
+use super::hero::{self, PartyHero};
+use super::net::{NetSession, PlayerId, BTN_MOBILITY};
 use super::units::{flat, Fx};
 use super::{Phase, Run};
 use benilla_world::world_point::WorldPoint;
@@ -170,41 +171,21 @@ impl Run {
 }
 
 /// `F`: cast the mobility if it is learned and ready; ticks the cooldown and the running effect.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn cast_mobility(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     phase: Res<State<Phase>>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
     world: WorldPoint,
-    mut hero: Query<(Entity, &mut Transform), With<Hero>>,
-    mut enemies: Query<(Entity, &Transform, &mut Enemy), Without<Hero>>,
+    mut heroes: Query<(Entity, &mut Transform, &PartyHero)>,
+    mut enemies: Query<(Entity, &Transform, &mut Enemy), Without<PartyHero>>,
     selection: Res<super::Selection>,
     aim: Res<hero::AimPoint>,
     mut fx: Fx,
 ) {
     let dt = time.delta_secs();
-    let m = &mut run.mobile;
-    m.cd = (m.cd - dt).max(0.0);
-    m.haste_t = (m.haste_t - dt).max(0.0);
-    m.vanish_t = (m.vanish_t - dt).max(0.0);
-    if *phase.get() != Phase::Playing || run.dead_t.is_some() || !keys.just_pressed(KEY) {
-        return;
-    }
-    let Some(def) = run.mobility() else { return };
-    if run.mobile.cd > 0.0 {
-        return;
-    }
-    let Ok((me, mut tf)) = hero.single_mut() else {
-        return;
-    };
-    let pos = tf.translation;
-    let facing = tf.rotation * Vec3::NEG_Z;
-    let facing = flat(facing).normalize_or(Vec3::NEG_Z);
-    // Aimed at the cursor where there is one, else straight ahead.
-    let cursor = aim.0.filter(|a| flat(*a - pos).length() > 0.5);
-    let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
-    // Keep any jump inside the battleground's leash.
     let map = selection.map_def();
     let center = hero::arena(map);
     let leash = |p: Vec3| {
@@ -216,63 +197,169 @@ pub(super) fn cast_mobility(
         }
     };
     let ground = |p: Vec3| world.terrain_height_under(p).unwrap_or(p.y);
-    match def.kind {
-        Move::Blink(yd) => {
-            fx.cast(me, def.spell, &[me], None);
-            // To the cursor, or as far as the spell reaches toward it.
-            let far = cursor.map_or(yd, |a| flat(a - pos).length().min(yd));
-            tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
-            let mut to = leash(pos + toward * far);
-            to.y = ground(to);
-            tf.translation = to;
+
+    if net.is_client() {
+        let m = &mut run.mobile;
+        m.cd = (m.cd - dt).max(0.0);
+        m.haste_t = (m.haste_t - dt).max(0.0);
+        m.vanish_t = (m.vanish_t - dt).max(0.0);
+        let local_down = run
+            .player(net.local_id)
+            .is_some_and(|c| c.is_down());
+        if *phase.get() != Phase::Playing
+            || run.dead_t.is_some()
+            || local_down
+            || !keys.just_pressed(KEY)
+        {
+            return;
         }
-        Move::Charge(yd) => {
-            // The enemy in reach nearest the cursor (or the hero, with none).
-            let mark = cursor.unwrap_or(pos);
-            let target = enemies
-                .iter()
-                .filter(|(_, t, e)| !e.dead && hero::reach(pos, t.translation) <= yd)
-                .map(|(e, t, _)| (e, t.translation, hero::reach(mark, t.translation)))
-                .min_by(|a, b| a.2.total_cmp(&b.2));
-            let to = match target {
-                Some((e, at, _)) => {
-                    if let Ok((_, _, mut en)) = enemies.get_mut(e) {
-                        en.stun_t = en.stun_t.max(def.secs);
+        let Some(def) = run.mobility() else { return };
+        if run.mobile.cd > 0.0 {
+            return;
+        }
+        net.latched_buttons |= BTN_MOBILITY;
+        run.mobile.cd = def.cooldown;
+        // Local client prediction for instant movement responsiveness
+        let local_id = net.local_id;
+        for (_, mut tf, ph) in &mut heroes {
+            if ph.id == local_id {
+                let pos = tf.translation;
+                let facing = flat(tf.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+                let cursor = aim.0.filter(|a| flat(*a - pos).length() > 0.5);
+                let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
+                match def.kind {
+                    Move::Blink(yd) => {
+                        let far = cursor.map_or(yd, |a| flat(a - pos).length().min(yd));
+                        tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
+                        let mut to = leash(pos + toward * far);
+                        to.y = ground(to);
+                        tf.translation = to;
                     }
-                    let dir = flat(at - pos).normalize_or(facing);
-                    tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(dir));
-                    fx.cast(me, def.spell, &[e], None);
-                    at - dir * 1.5
+                    Move::Haste(x) => {
+                        run.mobile.haste = x;
+                        run.mobile.haste_t = def.secs;
+                    }
+                    Move::Vanish(x) => {
+                        run.mobile.haste = x;
+                        run.mobile.haste_t = def.secs;
+                        run.mobile.vanish_t = def.secs;
+                    }
+                    _ => {}
                 }
-                None => {
-                    fx.cast(me, def.spell, &[me], None);
-                    tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
-                    pos + toward * yd * 0.5
-                }
-            };
-            let mut to = leash(to);
-            to.y = ground(to);
-            tf.translation = to;
-        }
-        Move::Haste(x) => {
-            fx.cast(me, def.spell, &[me], None);
-            run.mobile.haste = x;
-            run.mobile.haste_t = def.secs;
-        }
-        Move::Vanish(x) => {
-            fx.cast(me, def.spell, &[me], None);
-            run.mobile.haste = x;
-            run.mobile.haste_t = def.secs;
-            run.mobile.vanish_t = def.secs;
-        }
-        Move::Scatter(r) => {
-            fx.cast(me, def.spell, &[me], None);
-            for (_, t, mut en) in &mut enemies {
-                if !en.dead && !en.boss && hero::reach(pos, t.translation) <= r {
-                    en.fear_t = en.fear_t.max(def.secs);
-                }
+                break;
             }
         }
+        run.sync_combatant_from_local(local_id);
+        return;
     }
-    run.mobile.cd = def.cooldown;
+
+    let local_id = net.local_id;
+    run.sync_combatant_from_local(local_id);
+
+    for c in &mut run.players {
+        c.mobile.cd = (c.mobile.cd - dt).max(0.0);
+        c.mobile.haste_t = (c.mobile.haste_t - dt).max(0.0);
+        c.mobile.vanish_t = (c.mobile.vanish_t - dt).max(0.0);
+    }
+
+    if *phase.get() != Phase::Playing || run.dead_t.is_some() {
+        net.remote_mobility_requests.clear();
+        run.sync_local_from_combatant(local_id);
+        return;
+    }
+
+    let mut requests: Vec<(PlayerId, Option<Vec3>)> =
+        std::mem::take(&mut net.remote_mobility_requests);
+    if !net.headless && keys.just_pressed(KEY) {
+        requests.push((local_id, aim.0));
+    }
+
+    if run.level >= LEARN_LEVEL {
+        for (pid, cursor_aim) in requests {
+            let Some(p_idx) = run.players.iter().position(|p| p.id == pid) else {
+                continue;
+            };
+            if run.players[p_idx].is_down() || run.players[p_idx].mobile.cd > 0.0 {
+                continue;
+            }
+            let Some(def) = for_class(run.players[p_idx].class.id) else {
+                continue;
+            };
+            let mut hero_entry = None;
+            for (me, tf, ph) in &mut heroes {
+                if ph.id == pid {
+                    hero_entry = Some((me, tf));
+                    break;
+                }
+            }
+            let Some((me, mut tf)) = hero_entry else {
+                continue;
+            };
+            let pos = tf.translation;
+            let facing = tf.rotation * Vec3::NEG_Z;
+            let facing = flat(facing).normalize_or(Vec3::NEG_Z);
+            let cursor = cursor_aim.filter(|a| flat(*a - pos).length() > 0.5);
+            let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
+
+            match def.kind {
+                Move::Blink(yd) => {
+                    fx.cast(&mut net, me, def.spell, &[me], None);
+                    let far = cursor.map_or(yd, |a| flat(a - pos).length().min(yd));
+                    tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
+                    let mut to = leash(pos + toward * far);
+                    to.y = ground(to);
+                    tf.translation = to;
+                }
+                Move::Charge(yd) => {
+                    let mark = cursor.unwrap_or(pos);
+                    let target = enemies
+                        .iter()
+                        .filter(|(_, t, e)| !e.dead && hero::reach(pos, t.translation) <= yd)
+                        .map(|(e, t, _)| (e, t.translation, hero::reach(mark, t.translation)))
+                        .min_by(|a, b| a.2.total_cmp(&b.2));
+                    let to = match target {
+                        Some((e, at, _)) => {
+                            if let Ok((_, _, mut en)) = enemies.get_mut(e) {
+                                en.stun_t = en.stun_t.max(def.secs);
+                            }
+                            let dir = flat(at - pos).normalize_or(facing);
+                            tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(dir));
+                            fx.cast(&mut net, me, def.spell, &[e], None);
+                            at - dir * 1.5
+                        }
+                        None => {
+                            fx.cast(&mut net, me, def.spell, &[me], None);
+                            tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
+                            pos + toward * yd * 0.5
+                        }
+                    };
+                    let mut to = leash(to);
+                    to.y = ground(to);
+                    tf.translation = to;
+                }
+                Move::Haste(x) => {
+                    fx.cast(&mut net, me, def.spell, &[me], None);
+                    run.players[p_idx].mobile.haste = x;
+                    run.players[p_idx].mobile.haste_t = def.secs;
+                }
+                Move::Vanish(x) => {
+                    fx.cast(&mut net, me, def.spell, &[me], None);
+                    run.players[p_idx].mobile.haste = x;
+                    run.players[p_idx].mobile.haste_t = def.secs;
+                    run.players[p_idx].mobile.vanish_t = def.secs;
+                }
+                Move::Scatter(r) => {
+                    fx.cast(&mut net, me, def.spell, &[me], None);
+                    for (_, t, mut en) in &mut enemies {
+                        if !en.dead && !en.boss && hero::reach(pos, t.translation) <= r {
+                            en.fear_t = en.fear_t.max(def.secs);
+                        }
+                    }
+                }
+            }
+            run.players[p_idx].mobile.cd = def.cooldown;
+        }
+    }
+
+    run.sync_local_from_combatant(local_id);
 }

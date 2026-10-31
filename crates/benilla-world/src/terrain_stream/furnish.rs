@@ -38,7 +38,15 @@ pub(super) fn furnish_tile_cells(
     let cap = if live {
         CELL_SPAWN_CAP / CHUNKS_PER_CELL
     } else {
-        usize::MAX
+        match std::env::var("WOW_CELL_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(cap) => cap,
+            None => {
+                #[cfg(target_os = "windows")]
+                { usize::MAX }
+                #[cfg(not(target_os = "windows"))]
+                { usize::MAX }
+            }
+        }
     };
     // `WOW_NO_TILE_CELLS=1`: tiles stream without cell entities, but still mark furnished so the
     // loading screen converges.

@@ -12,9 +12,13 @@ use bevy::ui_render::ui_material::{MaterialNode, UiMaterial};
 use bevy::window::PrimaryWindow;
 
 use super::data::{self, AbilityDef, Effect, Kind, PassiveDef, Stat};
-use super::hero::{self, Hero};
+use super::hero::{self, Hero, PartyHero};
 use super::minimap::{self, MiniMap};
-use super::{Owned, Phase, Rng, Run, Selection, Stats};
+use super::net::{
+    NetCardChoice, NetChoiceKind, NetPhase, NetPlayerBuild, NetRole, NetSession, PlayerId,
+    ReliableMsg, MAX_PLAYERS, REVIVE_SECS,
+};
+use super::{Combatant, Owned, Phase, Rng, Run, Selection, Stats};
 
 const GOLD: Color = Color::srgb(1.0, 0.82, 0.0);
 /// The mobility button's edge, an action button's 36 units.
@@ -71,6 +75,32 @@ pub(super) struct OfferRow;
 /// The line under LEVEL UP: which level this is.
 #[derive(Component)]
 pub(super) struct LevelUpSub;
+
+// ── Co-op Party Frames & World Teammate Plates ──────────────────────────────────────────────────
+
+#[derive(Component)]
+pub(super) struct PartyColumn;
+#[derive(Component)]
+pub(super) struct PartyFrameSlot(usize);
+#[derive(Component)]
+pub(super) struct PartyNameText(usize);
+#[derive(Component)]
+pub(super) struct PartyClassText(usize);
+#[derive(Component)]
+pub(super) struct PartyHpFill(usize);
+#[derive(Component)]
+pub(super) struct PartyShieldFill(usize);
+#[derive(Component)]
+pub(super) struct PartyStatusText(usize);
+
+#[derive(Component)]
+pub(super) struct TeammatePlate(usize);
+#[derive(Component)]
+pub(super) struct TeammateName(usize);
+#[derive(Component)]
+pub(super) struct TeammateHpFill(usize);
+#[derive(Component)]
+pub(super) struct TeammateStatus(usize);
 
 /// A radial cooldown sweep over one ability icon: `sweep` is the remaining fraction
 /// (1.0 = just cast, 0.0 = ready), drawn by `ui_sweep.wgsl`.
@@ -192,6 +222,10 @@ impl Offer {
 
     pub(super) fn choices(&self) -> &[Choice] {
         &self.choices
+    }
+
+    pub(super) fn set_choices(&mut self, choices: Vec<Choice>) {
+        self.choices = choices;
     }
 }
 
@@ -516,6 +550,130 @@ pub(super) fn setup_hud(
                     ..default()
                 });
             });
+
+            // Classic WoW-style Co-op Party Frames on the left side under the ability rows.
+            root.spawn((
+                PartyColumn,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(12.0),
+                    top: Val::Px(104.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(8.0),
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .with_children(|col| {
+                for i in 0..MAX_PLAYERS {
+                    col.spawn((
+                        PartyFrameSlot(i),
+                        Node {
+                            width: Val::Px(188.0),
+                            flex_direction: FlexDirection::Column,
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                            row_gap: Val::Px(3.0),
+                            border: UiRect::all(Val::Px(1.5)),
+                            border_radius: BorderRadius::all(Val::Px(5.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.04, 0.04, 0.06, 0.86)),
+                        BorderColor::all(EDGE),
+                    ))
+                    .with_children(|slot| {
+                        slot.spawn(Node {
+                            width: Val::Percent(100.0),
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|top| {
+                            top.spawn((PartyNameText(i), text(f, "", 13.0, GOLD)));
+                            top.spawn((PartyClassText(i), text(f, "", 11.0, DIM)));
+                        });
+                        // Health & Shield bar
+                        slot.spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(12.0),
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.08, 0.02, 0.02, 0.95)),
+                            BorderColor::all(Color::srgba(0.35, 0.3, 0.2, 0.9)),
+                        ))
+                        .with_children(|bar| {
+                            bar.spawn((
+                                PartyHpFill(i),
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Percent(100.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.15, 0.82, 0.2)),
+                            ));
+                            bar.spawn((
+                                PartyShieldFill(i),
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: Val::Px(0.0),
+                                    top: Val::Px(0.0),
+                                    width: Val::Percent(0.0),
+                                    height: Val::Percent(100.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.75, 0.88, 1.0, 0.65)),
+                            ));
+                        });
+                        slot.spawn((PartyStatusText(i), text(f, "", 11.0, Color::WHITE)));
+                    });
+                }
+            });
+
+            // Floating world-space plates for remote teammates (name + health + revive progress).
+            for i in 0..MAX_PLAYERS {
+                root.spawn((
+                    TeammatePlate(i),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: Val::Px(120.0),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        row_gap: Val::Px(2.0),
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    bevy::ui::FocusPolicy::Pass,
+                ))
+                .with_children(|tp| {
+                    tp.spawn((TeammateName(i), centered(f, "", 13.0, Color::srgb(0.4, 0.85, 1.0))));
+                    tp.spawn((
+                        Node {
+                            width: Val::Px(84.0),
+                            height: Val::Px(7.0),
+                            border: UiRect::all(Val::Px(1.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+                        BorderColor::all(EDGE),
+                    ))
+                    .with_children(|bar| {
+                        bar.spawn((
+                            TeammateHpFill(i),
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Percent(100.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.85, 0.3)),
+                        ));
+                    });
+                    tp.spawn((TeammateStatus(i), centered(f, "", 12.0, GOLD)));
+                });
+            }
+
             root.spawn(Node {
                 position_type: PositionType::Absolute,
                 top: Val::Percent(22.0),
@@ -858,7 +1016,7 @@ pub(super) fn menu_preview(
     phase: Res<State<Phase>>,
     selection: Res<Selection>,
     mut run: ResMut<Run>,
-    heroes: Query<Entity, With<Hero>>,
+    heroes: Query<Entity, With<PartyHero>>,
     world: benilla_world::world_point::WorldPoint,
     mut shown: Local<Option<(usize, u32, usize)>>,
 ) {
@@ -896,7 +1054,7 @@ pub(super) fn menu_preview(
 }
 
 pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
-    let (Some(class), Some(&(_, race, _))) = (
+    let (Some(class), Some(&(display, race, sex))) = (
         selection.class_def(),
         selection.look.and_then(|i| selection.looks.get(i)),
     ) else {
@@ -905,44 +1063,114 @@ pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
     // The world goes to the battleground picked; until now it stood in the last one.
     selection.stage = selection.map;
     let next_guid = run.next_guid;
+    let c = Combatant::new(0, "Hero".into(), class, display, race, sex);
     *run = Run {
         class,
         race,
         next_guid,
+        hp: c.hp,
+        abilities: c.abilities.clone(),
+        players: vec![c],
+        version: 1,
         ..Run::default()
     };
-    run.abilities.push(Owned {
-        def: data::ability(class.start),
-        level: 1,
-        cd: 0.5,
-    });
-    run.hp = run.stats().max_hp;
-    run.version += 1;
     true
 }
 
-fn choices_for(run: &Run, rng: &mut Rng) -> Vec<Choice> {
+pub(super) fn start_run_with_net(
+    run: &mut Run,
+    selection: &mut Selection,
+    net: &mut NetSession,
+    rng: &mut Rng,
+) -> bool {
+    match net.role {
+        NetRole::Offline => start_run(run, selection),
+        NetRole::Client => {
+            // On a client, clicking the bottom button toggles Ready status in the lobby!
+            net.local_ready = !net.local_ready;
+            let class = selection.class.unwrap_or(0);
+            let (display, race, sex) = selection
+                .look
+                .and_then(|i| selection.looks.get(i))
+                .copied()
+                .unwrap_or((data::CLASSES[class].looks[0], 1, 0));
+            if let Some(client) = &net.client {
+                client.send_reliable(&ReliableMsg::UpdateLobby {
+                    class,
+                    display,
+                    race,
+                    sex,
+                    ready: net.local_ready,
+                });
+            }
+            false
+        }
+        NetRole::Host => {
+            if net.lobby_players.is_empty() || !net.lobby_players.iter().all(|p| p.ready) {
+                return false;
+            }
+            selection.stage = selection.map;
+            let next_guid = run.next_guid;
+            let players: Vec<Combatant> = net
+                .lobby_players
+                .iter()
+                .map(|lp| {
+                    let cls = &data::CLASSES[lp.class.min(data::CLASSES.len() - 1)];
+                    Combatant::new(
+                        lp.id,
+                        lp.name.clone(),
+                        cls,
+                        lp.display,
+                        lp.race,
+                        lp.sex,
+                    )
+                })
+                .collect();
+            let first_class = players.first().map_or(&data::CLASSES[0], |c| c.class);
+            let first_race = players.first().map_or(1, |c| c.race);
+            *run = Run {
+                class: first_class,
+                race: first_race,
+                next_guid,
+                players,
+                version: 1,
+                ..Run::default()
+            };
+            run.sync_local_from_combatant(net.local_id);
+            if let Some(host) = &net.host {
+                host.broadcast_reliable(&ReliableMsg::StartRun {
+                    map: selection.map,
+                    seed: rng.0,
+                    players: net.lobby_players.clone(),
+                });
+            }
+            true
+        }
+    }
+}
+
+pub(super) fn choices_for_combatant(c: &Combatant, rng: &mut Rng) -> Vec<Choice> {
     let mut pool: Vec<(Choice, f32)> = Vec::new();
-    for (i, o) in run.abilities.iter().enumerate() {
+    for (i, o) in c.abilities.iter().enumerate() {
         if o.level < data::MAX_ABILITY_LEVEL {
             pool.push((Choice::Upgrade(i), 1.2));
         }
     }
-    if run.abilities.len() < data::MAX_ABILITIES {
-        for key in run.class.pool {
-            if !run.abilities.iter().any(|o| o.def.key == *key) {
+    if c.abilities.len() < data::MAX_ABILITIES {
+        for key in c.class.pool {
+            if !c.abilities.iter().any(|o| o.def.key == *key) {
                 pool.push((Choice::NewAbility(data::ability(key)), 1.0));
             }
         }
     }
-    for (i, (_, level)) in run.passives.iter().enumerate() {
+    for (i, (_, level)) in c.passives.iter().enumerate() {
         if *level < data::MAX_PASSIVE_LEVEL {
             pool.push((Choice::UpPassive(i), 0.8));
         }
     }
-    if run.passives.len() < data::MAX_PASSIVES {
+    if c.passives.len() < data::MAX_PASSIVES {
         for p in data::PASSIVES {
-            if !run.passives.iter().any(|(q, _)| q.key == p.key) {
+            if !c.passives.iter().any(|(q, _)| q.key == p.key) {
                 pool.push((Choice::NewPassive(p), 0.5));
             }
         }
@@ -967,38 +1195,284 @@ fn choices_for(run: &Run, rng: &mut Rng) -> Vec<Choice> {
     out
 }
 
-pub(super) fn roll_offer(run: Res<Run>, mut rng: ResMut<Rng>, mut offer: ResMut<Offer>) {
-    offer.choices = choices_for(&run, &mut rng);
+fn choices_for(run: &Run, rng: &mut Rng) -> Vec<Choice> {
+    if let Some(c) = run.players.first() {
+        choices_for_combatant(c, rng)
+    } else {
+        let temp = Combatant {
+            id: 0,
+            name: String::new(),
+            class: run.class,
+            display: 0,
+            race: run.race,
+            sex: 0,
+            hp: run.hp,
+            abilities: run.abilities.clone(),
+            passives: run.passives.clone(),
+            shield: 0.0,
+            shield_t: 0.0,
+            immune_t: 0.0,
+            thorns: 0.0,
+            thorns_t: 0.0,
+            thorns_spell: 0,
+            heal_rate: 0.0,
+            heal_t: 0.0,
+            mobile: Default::default(),
+            downed_revive: None,
+        };
+        choices_for_combatant(&temp, rng)
+    }
+}
+
+pub(super) fn choice_to_net(c: &Combatant, choice: Choice) -> NetCardChoice {
+    match choice {
+        Choice::NewAbility(def) => NetCardChoice {
+            kind: NetChoiceKind::NewAbility,
+            key: def.key.to_string(),
+            next_level: 1,
+        },
+        Choice::Upgrade(k) => {
+            let o = &c.abilities[k];
+            NetCardChoice {
+                kind: NetChoiceKind::UpgradeAbility,
+                key: o.def.key.to_string(),
+                next_level: o.level + 1,
+            }
+        }
+        Choice::NewPassive(p) => NetCardChoice {
+            kind: NetChoiceKind::NewPassive,
+            key: p.key.to_string(),
+            next_level: 1,
+        },
+        Choice::UpPassive(k) => {
+            let (p, l) = c.passives[k];
+            NetCardChoice {
+                kind: NetChoiceKind::UpgradePassive,
+                key: p.key.to_string(),
+                next_level: l + 1,
+            }
+        }
+        Choice::Heal => NetCardChoice {
+            kind: NetChoiceKind::Heal,
+            key: String::new(),
+            next_level: 1,
+        },
+    }
+}
+
+pub(super) fn choice_from_net(c: &Combatant, nc: &NetCardChoice) -> Option<Choice> {
+    match nc.kind {
+        NetChoiceKind::NewAbility => Some(Choice::NewAbility(data::ability(&nc.key))),
+        NetChoiceKind::UpgradeAbility => c
+            .abilities
+            .iter()
+            .position(|o| o.def.key == nc.key)
+            .map(Choice::Upgrade),
+        NetChoiceKind::NewPassive => data::PASSIVES
+            .iter()
+            .find(|p| p.key == nc.key)
+            .map(Choice::NewPassive),
+        NetChoiceKind::UpgradePassive => c
+            .passives
+            .iter()
+            .position(|(p, _)| p.key == nc.key)
+            .map(Choice::UpPassive),
+        NetChoiceKind::Heal => Some(Choice::Heal),
+    }
+}
+
+pub(super) fn roll_and_broadcast_offers(
+    run: &mut Run,
+    net: &mut NetSession,
+    rng: &mut Rng,
+    offer: &mut Offer,
+) {
+    net.levelup_picked.clear();
+    net.host_offers.clear();
+    let mut wire_offers: HashMap<PlayerId, Vec<NetCardChoice>> = HashMap::new();
+    for c in &run.players {
+        let ch = choices_for_combatant(c, rng);
+        wire_offers.insert(
+            c.id,
+            ch.iter().copied().map(|choice| choice_to_net(c, choice)).collect(),
+        );
+        if !net.headless && c.id == net.local_id {
+            offer.choices = ch.clone();
+        }
+        net.host_offers.insert(c.id, ch);
+    }
+    if let Some(host) = &net.host {
+        host.broadcast_reliable(&ReliableMsg::LevelUpOffer {
+            level: run.level,
+            offers: wire_offers,
+            picked: net.levelup_picked.clone(),
+        });
+    }
+}
+
+pub(super) fn roll_offer(
+    mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
+    mut rng: ResMut<Rng>,
+    mut offer: ResMut<Offer>,
+) {
+    if net.is_client() {
+        return;
+    }
+    let local_id = net.local_id;
+    run.sync_combatant_from_local(local_id);
+    if net.role == NetRole::Host {
+        roll_and_broadcast_offers(&mut run, &mut net, &mut rng, &mut offer);
+    } else {
+        offer.choices = choices_for(&run, &mut rng);
+    }
+}
+
+pub(super) fn apply_choice_to_combatant(c: &mut Combatant, choice: Choice) {
+    match choice {
+        Choice::NewAbility(def) => c.abilities.push(Owned {
+            def,
+            level: 1,
+            cd: 0.3,
+        }),
+        Choice::Upgrade(k) => {
+            if let Some(o) = c.abilities.get_mut(k) {
+                o.level = (o.level + 1).min(data::MAX_ABILITY_LEVEL);
+            }
+        }
+        Choice::NewPassive(p) => c.passives.push((p, 1)),
+        Choice::UpPassive(k) => {
+            if let Some(p) = c.passives.get_mut(k) {
+                p.1 = (p.1 + 1).min(data::MAX_PASSIVE_LEVEL);
+            }
+        }
+        Choice::Heal => c.hp = c.stats().max_hp,
+    }
+}
+
+pub(super) fn apply_player_card_pick(
+    pid: PlayerId,
+    index: usize,
+    run: &mut Run,
+    net: &mut NetSession,
+    offer: &mut Offer,
+    rng: &mut Rng,
+    next: &mut NextState<Phase>,
+) {
+    if net.levelup_picked.contains(&pid) {
+        return;
+    }
+    let Some(choices) = net.host_offers.get(&pid).cloned() else {
+        return;
+    };
+    let Some(&choice) = choices.get(index) else {
+        return;
+    };
+    if let Some(c) = run.player_mut(pid) {
+        apply_choice_to_combatant(c, choice);
+    }
+    if !net.headless && pid == net.local_id {
+        run.sync_local_from_combatant(net.local_id);
+        run.version += 1;
+    }
+    net.levelup_picked.push(pid);
+
+    let all_picked = net
+        .lobby_players
+        .iter()
+        .all(|lp| net.levelup_picked.contains(&lp.id));
+
+    if !all_picked {
+        if let Some(host) = &net.host {
+            host.broadcast_reliable(&ReliableMsg::LevelUpProgress {
+                picked: net.levelup_picked.clone(),
+            });
+        }
+        return;
+    }
+
+    run.pending_levels = run.pending_levels.saturating_sub(1);
+    if run.pending_levels > 0 {
+        roll_and_broadcast_offers(run, net, rng, offer);
+    } else {
+        offer.choices.clear();
+        let mut player_builds = HashMap::new();
+        for c in &run.players {
+            player_builds.insert(
+                c.id,
+                NetPlayerBuild {
+                    abilities: c
+                        .abilities
+                        .iter()
+                        .map(|o| (o.def.key.to_string(), o.level))
+                        .collect(),
+                    passives: c
+                        .passives
+                        .iter()
+                        .map(|(p, l)| (p.key.to_string(), *l))
+                        .collect(),
+                },
+            );
+        }
+        if let Some(host) = &net.host {
+            host.broadcast_reliable(&ReliableMsg::ResumeFromLevelUp { player_builds });
+        }
+        next.set(Phase::Playing);
+    }
 }
 
 pub(super) fn pick(
     i: usize,
     run: &mut Run,
+    net: &mut NetSession,
     offer: &mut Offer,
     rng: &mut Rng,
     next: &mut NextState<Phase>,
 ) {
-    let Some(&choice) = offer.choices.get(i) else {
-        return;
-    };
-    match choice {
-        Choice::NewAbility(def) => run.abilities.push(Owned {
-            def,
-            level: 1,
-            cd: 0.3,
-        }),
-        Choice::Upgrade(k) => run.abilities[k].level += 1,
-        Choice::NewPassive(p) => run.passives.push((p, 1)),
-        Choice::UpPassive(k) => run.passives[k].1 += 1,
-        Choice::Heal => run.hp = run.stats().max_hp,
-    }
-    run.version += 1;
-    run.pending_levels = run.pending_levels.saturating_sub(1);
-    if run.pending_levels > 0 {
-        offer.choices = choices_for(run, rng);
-    } else {
-        offer.choices.clear();
-        next.set(Phase::Playing);
+    match net.role {
+        NetRole::Offline => {
+            let Some(&choice) = offer.choices.get(i) else {
+                return;
+            };
+            let local_id = net.local_id;
+            run.sync_combatant_from_local(local_id);
+            if let Some(c) = run.player_mut(local_id) {
+                apply_choice_to_combatant(c, choice);
+                run.sync_local_from_combatant(local_id);
+            } else {
+                match choice {
+                    Choice::NewAbility(def) => run.abilities.push(Owned {
+                        def,
+                        level: 1,
+                        cd: 0.3,
+                    }),
+                    Choice::Upgrade(k) => run.abilities[k].level += 1,
+                    Choice::NewPassive(p) => run.passives.push((p, 1)),
+                    Choice::UpPassive(k) => run.passives[k].1 += 1,
+                    Choice::Heal => run.hp = run.stats().max_hp,
+                }
+            }
+            run.version += 1;
+            run.pending_levels = run.pending_levels.saturating_sub(1);
+            if run.pending_levels > 0 {
+                offer.choices = choices_for(run, rng);
+            } else {
+                offer.choices.clear();
+                next.set(Phase::Playing);
+            }
+        }
+        NetRole::Host => {
+            let local_id = net.local_id;
+            apply_player_card_pick(local_id, i, run, net, offer, rng, next);
+        }
+        NetRole::Client => {
+            if !net.levelup_picked.contains(&net.local_id) {
+                net.levelup_picked.push(net.local_id);
+                if let Some(client) = &net.client {
+                    client.send_reliable(&ReliableMsg::PickCard { index: i });
+                }
+            }
+        }
     }
 }
 
@@ -1025,6 +1499,7 @@ pub(super) fn buttons(
         Changed<Interaction>,
     >,
     mut next: ResMut<NextState<Phase>>,
+    mut net: ResMut<NetSession>,
     mut exit: MessageWriter<AppExit>,
     phase: Res<State<Phase>>,
 ) {
@@ -1035,8 +1510,31 @@ pub(super) fn buttons(
             Interaction::Pressed => {
                 bg.0 = BUTTON_HOT;
                 match (*action, *phase.get()) {
-                    (UiAction::Resume, Phase::Paused) => next.set(Phase::Playing),
-                    (UiAction::MainMenu, Phase::Paused | Phase::GameOver) => next.set(Phase::Menu),
+                    (UiAction::Resume, Phase::Paused) => {
+                        if let Some(host) = &net.host {
+                            host.broadcast_reliable(&ReliableMsg::SetPhase {
+                                phase: NetPhase::Playing,
+                                won: false,
+                            });
+                        } else if let Some(client) = &net.client {
+                            client.send_reliable(&ReliableMsg::SetPhase {
+                                phase: NetPhase::Playing,
+                                won: false,
+                            });
+                        }
+                        next.set(Phase::Playing);
+                    }
+                    (UiAction::MainMenu, Phase::Paused | Phase::GameOver) => {
+                        if let Some(host) = &net.host {
+                            host.broadcast_reliable(&ReliableMsg::SetPhase {
+                                phase: NetPhase::Menu,
+                                won: false,
+                            });
+                        } else if net.is_client() {
+                            net.disconnect();
+                        }
+                        next.set(Phase::Menu);
+                    }
                     (UiAction::Quit, Phase::Paused | Phase::GameOver) => {
                         exit.write(AppExit::Success);
                     }
@@ -1052,27 +1550,62 @@ pub(super) fn keys(
     phase: Res<State<Phase>>,
     mut selection: ResMut<Selection>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
+    mut rng: ResMut<Rng>,
     mut next: ResMut<NextState<Phase>>,
 ) {
+    if net.ip_focused && *phase.get() == Phase::Menu {
+        return;
+    }
     match phase.get() {
         Phase::Menu => {
-            if keys.just_pressed(KeyCode::Enter) && start_run(&mut run, &mut selection) {
+            if keys.just_pressed(KeyCode::Enter)
+                && start_run_with_net(&mut run, &mut selection, &mut net, &mut rng)
+            {
                 next.set(Phase::Playing);
             }
         }
         Phase::Playing => {
             if keys.just_pressed(KeyCode::Escape) {
+                if let Some(host) = &net.host {
+                    host.broadcast_reliable(&ReliableMsg::SetPhase {
+                        phase: NetPhase::Paused,
+                        won: false,
+                    });
+                } else if let Some(client) = &net.client {
+                    client.send_reliable(&ReliableMsg::SetPhase {
+                        phase: NetPhase::Paused,
+                        won: false,
+                    });
+                }
                 next.set(Phase::Paused);
             }
         }
         Phase::Paused => {
             if keys.just_pressed(KeyCode::Escape) {
+                if let Some(host) = &net.host {
+                    host.broadcast_reliable(&ReliableMsg::SetPhase {
+                        phase: NetPhase::Playing,
+                        won: false,
+                    });
+                } else if let Some(client) = &net.client {
+                    client.send_reliable(&ReliableMsg::SetPhase {
+                        phase: NetPhase::Playing,
+                        won: false,
+                    });
+                }
                 next.set(Phase::Playing);
             }
         }
         Phase::LevelUp => {}
         Phase::GameOver => {
             if keys.just_pressed(KeyCode::Enter) {
+                if let Some(host) = &net.host {
+                    host.broadcast_reliable(&ReliableMsg::SetPhase {
+                        phase: NetPhase::Menu,
+                        won: false,
+                    });
+                }
                 next.set(Phase::Menu);
             }
         }
@@ -1128,7 +1661,16 @@ pub(super) fn describe_card(
             }
         }
         Choice::Upgrade(k) => {
-            let o = &run.abilities[k];
+            let Some(o) = run.abilities.get(k) else {
+                return CardText {
+                    spell: 5720,
+                    name: "Upgrade".into(),
+                    tag: String::new(),
+                    tag_color: Color::WHITE,
+                    desc: String::new(),
+                    ranks: None,
+                };
+            };
             let next = o.level + 1;
             let stats = run.stats();
             let (a, b) = (
@@ -1179,7 +1721,16 @@ pub(super) fn describe_card(
             ranks: Some((0, data::MAX_PASSIVE_LEVEL)),
         },
         Choice::UpPassive(k) => {
-            let (p, level) = run.passives[k];
+            let Some(&(p, level)) = run.passives.get(k) else {
+                return CardText {
+                    spell: 5720,
+                    name: "Talent".into(),
+                    tag: String::new(),
+                    tag_color: Color::WHITE,
+                    desc: String::new(),
+                    ranks: None,
+                };
+            };
             let fmt = |v: f32| match p.stat {
                 Stat::Regen | Stat::Armor => num(v),
                 _ => pct(v),
@@ -1364,6 +1915,237 @@ pub(super) fn refresh_hud(
                 });
             }
         });
+    }
+}
+
+/// Update the co-op party frames on the left of the HUD and the world-space plates over remote heroes.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(super) fn refresh_party_frames(
+    run: Res<Run>,
+    net: Res<NetSession>,
+    ui_scale: Res<UiScale>,
+    cams: Query<(&Camera, &Transform), With<WorldCamera>>,
+    remote_heroes: Query<(&Transform, &PartyHero), Without<Hero>>,
+    mut col: Query<&mut Node, (With<PartyColumn>, Without<PartyFrameSlot>)>,
+    mut slots: Query<(&PartyFrameSlot, &mut Node, &mut BorderColor), Without<PartyColumn>>,
+    mut hp_fills: Query<
+        (&PartyHpFill, &mut Node, &mut BackgroundColor),
+        (Without<PartyColumn>, Without<PartyFrameSlot>),
+    >,
+    mut shield_fills: Query<
+        (&PartyShieldFill, &mut Node),
+        (
+            Without<PartyColumn>,
+            Without<PartyFrameSlot>,
+            Without<PartyHpFill>,
+        ),
+    >,
+    mut plates: Query<
+        (&TeammatePlate, &mut Node, &mut Visibility),
+        (
+            Without<PartyColumn>,
+            Without<PartyFrameSlot>,
+            Without<PartyHpFill>,
+            Without<PartyShieldFill>,
+        ),
+    >,
+    mut plate_hps: Query<
+        (&TeammateHpFill, &mut Node, &mut BackgroundColor),
+        (
+            Without<PartyColumn>,
+            Without<PartyFrameSlot>,
+            Without<PartyHpFill>,
+            Without<PartyShieldFill>,
+            Without<TeammatePlate>,
+        ),
+    >,
+    mut texts: ParamSet<(
+        Query<(&PartyNameText, &mut Text, &mut TextColor)>,
+        Query<(&PartyClassText, &mut Text)>,
+        Query<(&PartyStatusText, &mut Text, &mut TextColor)>,
+        Query<(&TeammateName, &mut Text, &mut TextColor)>,
+        Query<(&TeammateStatus, &mut Text, &mut TextColor)>,
+    )>,
+) {
+    let show_party = run.players.len() > 1 || net.is_online();
+    if let Ok(mut cnode) = col.single_mut() {
+        let want = if show_party {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if cnode.display != want {
+            cnode.display = want;
+        }
+    }
+
+    for (slot, mut node, mut border) in &mut slots {
+        let i = slot.0;
+        let Some(p) = run.players.get(i) else {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+            continue;
+        };
+        if node.display != Display::Flex {
+            node.display = Display::Flex;
+        }
+        let border_col = if p.is_down() {
+            Color::srgb(0.95, 0.2, 0.15)
+        } else if p.id == net.local_id {
+            GOLD
+        } else {
+            EDGE
+        };
+        *border = BorderColor::all(border_col);
+    }
+
+    for (fill, mut node, mut bg) in &mut hp_fills {
+        if let Some(p) = run.players.get(fill.0) {
+            let max_hp = p.stats().max_hp.max(1.0);
+            let frac = (p.hp / max_hp).clamp(0.0, 1.0);
+            node.width = Val::Percent(frac * 100.0);
+            bg.0 = if p.is_down() {
+                Color::srgb(0.75, 0.15, 0.15)
+            } else {
+                rgb(p.class.color).mix(&Color::srgb(0.15, 0.85, 0.25), 0.35)
+            };
+        }
+    }
+
+    for (sfill, mut node) in &mut shield_fills {
+        if let Some(p) = run.players.get(sfill.0) {
+            let max_hp = p.stats().max_hp.max(1.0);
+            let frac = if p.shield_t > 0.0 {
+                (p.shield / max_hp).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            node.width = Val::Percent(frac * 100.0);
+        }
+    }
+
+    for (nt, mut text, mut tc) in &mut texts.p0() {
+        if let Some(p) = run.players.get(nt.0) {
+            let tag = if p.id == net.local_id { " (You)" } else { "" };
+            let want = format!("{}{tag}", p.name);
+            if text.0 != want {
+                text.0 = want;
+            }
+            tc.0 = rgb(p.class.color);
+        }
+    }
+
+    for (ct, mut text) in &mut texts.p1() {
+        if let Some(p) = run.players.get(ct.0) {
+            let want = format!("Lv{} {}", run.level, p.class.name);
+            if text.0 != want {
+                text.0 = want;
+            }
+        }
+    }
+
+    for (st, mut text, mut tc) in &mut texts.p2() {
+        if let Some(p) = run.players.get(st.0) {
+            let max_hp = p.stats().max_hp.max(1.0);
+            let (want, col) = match p.downed_revive {
+                Some(rev) if rev > 0.01 => (
+                    format!(
+                        "DOWNED • Reviving {:.0}%",
+                        (rev / REVIVE_SECS * 100.0).clamp(0.0, 100.0)
+                    ),
+                    GOLD,
+                ),
+                Some(_) => (
+                    "DOWNED • Stand Near to Revive!".to_string(),
+                    Color::srgb(1.0, 0.32, 0.28),
+                ),
+                None => (
+                    format!("{:.0} / {:.0} HP", p.hp.ceil(), max_hp.round()),
+                    Color::srgb(0.85, 0.85, 0.85),
+                ),
+            };
+            if text.0 != want {
+                text.0 = want;
+            }
+            tc.0 = col;
+        }
+    }
+
+    // World-space floating teammate plates for remote heroes.
+    let remote_list: Vec<(&Transform, PlayerId)> =
+        remote_heroes.iter().map(|(tf, ph)| (tf, ph.id)).collect();
+    let cam_pair = cams.single().ok();
+    let s = ui_scale.0.max(0.001);
+
+    for (tp, mut node, mut vis) in &mut plates {
+        let idx = tp.0;
+        let Some(&(tf, pid)) = remote_list.get(idx) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        let Some((cam, cam_tf)) = cam_pair else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        let head = tf.translation + Vec3::Y * 2.55;
+        let Ok(screen) = cam.world_to_viewport(&GlobalTransform::from(*cam_tf), head) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        *vis = Visibility::Inherited;
+        node.left = Val::Px(screen.x / s - 60.0);
+        node.top = Val::Px(screen.y / s - 32.0);
+        let _ = pid;
+    }
+
+    for (hp, mut node, mut bg) in &mut plate_hps {
+        if let Some(&(_, pid)) = remote_list.get(hp.0) {
+            if let Some(p) = run.player(pid) {
+                let max_hp = p.stats().max_hp.max(1.0);
+                let frac = if let Some(rev) = p.downed_revive {
+                    (rev / REVIVE_SECS).clamp(0.0, 1.0)
+                } else {
+                    (p.hp / max_hp).clamp(0.0, 1.0)
+                };
+                node.width = Val::Percent(frac * 100.0);
+                bg.0 = if p.is_down() {
+                    GOLD
+                } else {
+                    rgb(p.class.color)
+                };
+            }
+        }
+    }
+
+    for (tn, mut text, mut tc) in &mut texts.p3() {
+        if let Some(&(_, pid)) = remote_list.get(tn.0) {
+            if let Some(p) = run.player(pid) {
+                if text.0 != p.name {
+                    text.0.clone_from(&p.name);
+                }
+                tc.0 = rgb(p.class.color);
+            }
+        }
+    }
+
+    for (ts, mut text, mut tc) in &mut texts.p4() {
+        if let Some(&(_, pid)) = remote_list.get(ts.0) {
+            if let Some(p) = run.player(pid) {
+                let (want, col) = match p.downed_revive {
+                    Some(rev) if rev > 0.01 => (
+                        format!("REVIVING {:.0}%", (rev / REVIVE_SECS * 100.0).min(100.0)),
+                        GOLD,
+                    ),
+                    Some(_) => ("DOWNED - REVIVE!".to_string(), Color::srgb(1.0, 0.25, 0.2)),
+                    None => (String::new(), Color::WHITE),
+                };
+                if text.0 != want {
+                    text.0 = want;
+                }
+                tc.0 = col;
+            }
+        }
     }
 }
 
@@ -1639,8 +2421,6 @@ impl TipLine {
         self
     }
 }
-
-/// A number as the tooltips print it: whole when near enough, else to one decimal.
 
 /// The results screen's tiles and its line under the title.
 #[allow(clippy::type_complexity)]
@@ -1930,7 +2710,6 @@ fn ability_tip(
     lines
 }
 
-/// What a passive's bonus `v` does, in the voice of a buff.
 /// A stat's short name, for the card's before » after line.
 fn stat_label(stat: Stat) -> &'static str {
     match stat {
@@ -2200,7 +2979,8 @@ pub(super) fn show_panels(
             Visibility::Inherited
         } else {
             Visibility::Hidden
-        };
+        }
+        ;
         if *v != want {
             *v = want;
         }

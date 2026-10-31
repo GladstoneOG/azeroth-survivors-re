@@ -6,7 +6,9 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use super::data::Weapon;
-use super::RunEntity;
+use super::hero::PartyHero;
+use super::net::{NetFxEvent, NetSession};
+use super::{NetId, RunEntity};
 use crate::combat_text::CombatTextSpawn;
 use crate::creature_anim::{CastEvent, CastEventKind, PlaySeq, SpellGoTargets, SwingMessage};
 use crate::net::{FieldChanged, Guid, NetEntity, ObjectStore};
@@ -153,6 +155,13 @@ pub(super) fn kill_unit(store: &mut ObjectStore) {
         .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 0)]));
 }
 
+/// Restore health in the descriptor so a revived unit stands back up from the corpse pose.
+pub(super) fn revive_unit(store: &mut ObjectStore) {
+    store
+        .0
+        .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 100)]));
+}
+
 /// A dynamic object, as a ground spell's server would place it: the dest-effect systems arm the
 /// spell's area visuals on it.
 pub(super) fn spawn_area_object(
@@ -218,6 +227,13 @@ impl Marks {
         }
     }
 
+    pub fn active_spells(&self) -> Vec<u32> {
+        self.slots
+            .iter()
+            .filter_map(|&(s, _)| (s != 0).then_some(s))
+            .collect()
+    }
+
     /// Show `spell` for `secs`, refreshing it if already shown.
     pub fn add(&mut self, spell: u32, secs: f32) {
         if let Some(slot) = self.slots.iter_mut().find(|s| s.0 == spell) {
@@ -278,7 +294,6 @@ impl Marks {
         for (i, &(spell, _)) in self.slots.iter().enumerate() {
             pairs.push((FIELD_AURA + u16::from(self.base) + i as u16, spell));
             if spell != 0 {
-                // Effect 0 live, and a buff is cancelable.
                 let flags = 0x2 | u32::from(self.base < 32);
                 word |= flags << (i * 4);
             }
@@ -296,22 +311,68 @@ impl Marks {
     }
 }
 
-/// The messages that make a local cast look like a server's.
+/// The messages that make a local cast look like a server's, plus optional network replication.
 #[derive(SystemParam)]
-pub(super) struct Fx<'w> {
+pub(super) struct Fx<'w, 's> {
     seq: ResMut<'w, PlaySeq>,
     casts: MessageWriter<'w, CastEvent>,
     gos: MessageWriter<'w, SpellGoTargets>,
     swings: MessageWriter<'w, SwingMessage>,
     text: MessageWriter<'w, CombatTextSpawn>,
+    net_ids: Query<'w, 's, (Option<&'static PartyHero>, Option<&'static NetId>)>,
 }
 
 /// More impacts than this per cast only cost frames.
 const MAX_VISUAL_HITS: usize = 12;
 
-impl Fx<'_> {
+impl Fx<'_, '_> {
+    fn resolve_id(&self, e: Entity) -> Option<(bool, u32)> {
+        let (ph, nid) = self.net_ids.get(e).ok()?;
+        if let Some(ph) = ph {
+            Some((true, u32::from(ph.id)))
+        } else {
+            nid.map(|n| (false, n.0))
+        }
+    }
+
     /// `SMSG_SPELL_GO`: the cast kit on the caster, and a missile or an impact at each hit.
-    pub fn cast(&mut self, caster: Entity, spell: u32, hits: &[Entity], dest: Option<Vec3>) {
+    pub fn cast(
+        &mut self,
+        net: &mut NetSession,
+        caster: Entity,
+        spell: u32,
+        hits: &[Entity],
+        dest: Option<Vec3>,
+    ) {
+        self.cast_local(caster, spell, hits, dest);
+        if net.role == super::net::NetRole::Host {
+            if let Some((caster_is_player, caster_id)) = self.resolve_id(caster) {
+                let targets: Vec<u32> = hits
+                    .iter()
+                    .copied()
+                    .take(MAX_VISUAL_HITS)
+                    .filter_map(|h| self.resolve_id(h).map(|(_, id)| id))
+                    .collect();
+                let seq = net.next_fx_seq();
+                net.record_fx(NetFxEvent::Cast {
+                    seq,
+                    caster_is_player,
+                    caster_id,
+                    spell,
+                    targets,
+                    dest: dest.map(|d| d.to_array()),
+                });
+            }
+        }
+    }
+
+    pub fn cast_local(
+        &mut self,
+        caster: Entity,
+        spell: u32,
+        hits: &[Entity],
+        dest: Option<Vec3>,
+    ) {
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: caster,
@@ -331,7 +392,22 @@ impl Fx<'_> {
     }
 
     /// Only the spell's impact kit, on `target`: no cast animation on anyone.
-    pub fn impact(&mut self, target: Entity, spell: u32) {
+    pub fn impact(&mut self, net: &mut NetSession, target: Entity, spell: u32) {
+        self.impact_local(target, spell);
+        if net.role == super::net::NetRole::Host {
+            if let Some((target_is_player, target_id)) = self.resolve_id(target) {
+                let seq = net.next_fx_seq();
+                net.record_fx(NetFxEvent::Impact {
+                    seq,
+                    target_is_player,
+                    target_id,
+                    spell,
+                });
+            }
+        }
+    }
+
+    pub fn impact_local(&mut self, target: Entity, spell: u32) {
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: target,
@@ -344,7 +420,32 @@ impl Fx<'_> {
     }
 
     /// A melee swing: the attack animation, the victim's flinch, blood and the hit sound.
-    pub fn swing(&mut self, attacker: Entity, victim: Entity, damage: f32) {
+    pub fn swing(
+        &mut self,
+        net: &mut NetSession,
+        attacker: Entity,
+        victim: Entity,
+        damage: f32,
+    ) {
+        self.swing_local(attacker, victim, damage);
+        if net.role == super::net::NetRole::Host {
+            if let (Some((att_pl, att_id)), Some((vic_pl, vic_id))) =
+                (self.resolve_id(attacker), self.resolve_id(victim))
+            {
+                let seq = net.next_fx_seq();
+                net.record_fx(NetFxEvent::Swing {
+                    seq,
+                    attacker_is_player: att_pl,
+                    attacker_id: att_id,
+                    victim_is_player: vic_pl,
+                    victim_id: vic_id,
+                    damage,
+                });
+            }
+        }
+    }
+
+    pub fn swing_local(&mut self, attacker: Entity, victim: Entity, damage: f32) {
         let seq = self.seq.next();
         self.swings.write(SwingMessage {
             attacker,
@@ -358,7 +459,31 @@ impl Fx<'_> {
     }
 
     /// A floating number over `anchor`, 0xAARRGGBB.
-    pub fn number(&mut self, anchor: Entity, amount: f32, crit: bool, color: u32) {
+    pub fn number(
+        &mut self,
+        net: &mut NetSession,
+        anchor: Entity,
+        amount: f32,
+        crit: bool,
+        color: u32,
+    ) {
+        self.number_local(anchor, amount, crit, color);
+        if net.role == super::net::NetRole::Host {
+            if let Some((anchor_is_player, anchor_id)) = self.resolve_id(anchor) {
+                let seq = net.next_fx_seq();
+                net.record_fx(NetFxEvent::CombatNumber {
+                    seq,
+                    anchor_is_player,
+                    anchor_id,
+                    amount,
+                    crit,
+                    color,
+                });
+            }
+        }
+    }
+
+    pub fn number_local(&mut self, anchor: Entity, amount: f32, crit: bool, color: u32) {
         let shown = amount.round().max(1.0) as i64;
         self.text.write(CombatTextSpawn {
             anchor,

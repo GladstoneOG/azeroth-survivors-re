@@ -11,6 +11,7 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use super::enemies::{Enemy, Gem};
 use super::hero::Hero;
 use super::hud::{self, Offer};
+use super::net::NetSession;
 use super::units::flat;
 use super::{data, Phase, Rng, Run, Selection};
 
@@ -160,6 +161,7 @@ pub(super) fn drive(
     mut next: ResMut<NextState<Phase>>,
     mut selection: ResMut<Selection>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
     mut offer: ResMut<Offer>,
     mut rng: ResMut<Rng>,
     loading: Res<crate::loading_screen::LoadingScreen>,
@@ -210,6 +212,7 @@ pub(super) fn drive(
                     run.bosses = 3;
                     run.rings = 4;
                 }
+                run.sync_combatant_from_local(net.local_id);
                 next.set(Phase::Playing);
                 auto.wait = 0.0;
             }
@@ -222,7 +225,7 @@ pub(super) fn drive(
             if auto.wait > 1.6 {
                 let n = offer.len().max(1);
                 let i = (rng.range(0.0, n as f32) as usize).min(n - 1);
-                hud::pick(i, &mut run, &mut offer, &mut rng, &mut next);
+                hud::pick(i, &mut run, &mut net, &mut offer, &mut rng, &mut next);
                 auto.wait = 0.0;
             }
         }

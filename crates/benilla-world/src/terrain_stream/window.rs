@@ -90,6 +90,9 @@ pub fn inner_radius(farclip: f32) -> i32 {
 
 /// The outer half-width in chunks: `max(inner + 2, 8)`.
 pub fn outer_radius(inner: i32) -> i32 {
+    if let Some(r) = std::env::var("WOW_CHUNK_RADIUS").ok().and_then(|s| s.parse::<i32>().ok()) {
+        return (inner + 2).min(r).max(1);
+    }
     (inner + 2).max(OUTER_FLOOR_CHUNKS)
 }
 

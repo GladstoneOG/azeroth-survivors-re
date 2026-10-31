@@ -231,7 +231,19 @@ pub(crate) fn furnish_model_forms(
         }
     }
 
-    let cap = if focus.paced { MESH_BUDGET } else { usize::MAX };
+    let cap = if focus.paced {
+        MESH_BUDGET
+    } else {
+        match std::env::var("WOW_FORM_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(cap) => cap,
+            None => {
+                #[cfg(target_os = "windows")]
+                { usize::MAX }
+                #[cfg(not(target_os = "windows"))]
+                { usize::MAX }
+            }
+        }
+    };
 
     let mut pending: Vec<(i32, ModelKey)> = forms
         .entries

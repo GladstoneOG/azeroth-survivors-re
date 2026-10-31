@@ -51,8 +51,13 @@ impl Plugin for FpsJournalPlugin {
     fn build(&self, app: &mut App) {
         // Bevy's per-pass render diagnostics, the source of the GPU columns and of Tracy's GPU
         // zones, registered in every build.
-        app.add_plugins(RenderDiagnosticsPlugin)
-            .init_resource::<FpsJournalSetting>()
+        #[cfg(not(target_os = "windows"))]
+        app.add_plugins(RenderDiagnosticsPlugin);
+        #[cfg(target_os = "windows")]
+        if std::env::var_os("WOW_FPS_JOURNAL").is_some() {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        app.init_resource::<FpsJournalSetting>()
             .add_observer(on_cvar)
             .insert_resource(FpsJournal {
                 #[cfg(not(target_arch = "wasm32"))]

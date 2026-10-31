@@ -1,6 +1,7 @@
 //! The run's pick screen, laid out like the 1.12 character create and select glue screens and built
 //! from their own widgets and art ([`crate::glue`]): the race, gender and class tower on the left,
-//! the zone list in the character-select frame on the right, Enter World at the bottom.
+//! the zone list in the character-select frame on the right, the LAN multiplayer lobby at top
+//! centre, and Enter World at the bottom.
 //!
 //! The survivors HUD lays out on the 768-unit canvas through `UiScale`, so every glue builder here
 //! takes a unit scale.
@@ -8,7 +9,8 @@
 use bevy::prelude::*;
 use bevy::ui_render::ui_material::MaterialNode;
 
-use super::hud::{looks_for, rgb, start_run, HudFont, MenuRoot};
+use super::hud::{looks_for, rgb, start_run_with_net, text_bundle, HudFont, MenuRoot};
+use super::net::{LobbyPlayer, NetRole, NetSession, ReliableMsg, DEFAULT_PORT, MAX_PLAYERS};
 use super::{data, Phase, Rng, Run, Selection};
 use crate::char_select::race_name;
 use crate::glue::art::{class_tc, race_tc, tc_rect, GlueArt, DIM, GOLD, NAME_EDGE};
@@ -45,6 +47,10 @@ pub(super) enum MenuAction {
     Map(usize),
     Randomize,
     Enter,
+    FocusIp,
+    HostGame,
+    JoinGame,
+    LeaveNet,
 }
 
 /// On [`MenuRoot`] once the glue art is in and the screen is built.
@@ -57,6 +63,21 @@ pub(super) struct RaceFace(u8);
 
 #[derive(Component)]
 pub(super) struct PickName;
+
+#[derive(Component)]
+pub(super) struct LobbyStatusText;
+
+#[derive(Component)]
+pub(super) struct LobbyIpBox;
+
+#[derive(Component)]
+pub(super) struct LobbyIpText;
+
+#[derive(Component)]
+pub(super) struct LobbySlotText(usize);
+
+#[derive(Component)]
+pub(super) struct LobbyHintText;
 
 /// The saved pick, `benilla-config/survivors-pick.txt` (`localStorage` on the page):
 /// `class race sex map`, restored at the menu so a reload keeps the last hero and zone.
@@ -133,6 +154,60 @@ fn set(sel: &mut Selection, all: &[Vec<(u32, u8, u8)>], class: usize, look: usiz
     sel.version += 1;
 }
 
+pub(super) fn local_lobby_player(sel: &Selection, net: &NetSession) -> LobbyPlayer {
+    let class = sel.class.unwrap_or(0);
+    let (display, race, sex) = sel
+        .look
+        .and_then(|i| sel.looks.get(i))
+        .copied()
+        .unwrap_or((data::CLASSES[class].looks[0], 1, 0));
+    LobbyPlayer {
+        id: net.local_id,
+        name: net.player_name.clone(),
+        class,
+        display,
+        race,
+        sex,
+        ready: if net.role == NetRole::Host {
+            true
+        } else {
+            net.local_ready
+        },
+    }
+}
+
+fn sync_local_pick_to_net(sel: &Selection, net: &mut NetSession) {
+    let lp = local_lobby_player(sel, net);
+    match net.role {
+        NetRole::Offline => {}
+        NetRole::Host => {
+            if let Some(slot) = net.lobby_players.iter_mut().find(|p| p.id == net.local_id) {
+                slot.class = lp.class;
+                slot.display = lp.display;
+                slot.race = lp.race;
+                slot.sex = lp.sex;
+            }
+            if let Some(host) = &net.host {
+                host.broadcast_reliable(&ReliableMsg::LobbyState {
+                    map: sel.map,
+                    players: net.lobby_players.clone(),
+                });
+            }
+        }
+        NetRole::Client => {
+            if let Some(client) = &net.client {
+                client.send_reliable(&ReliableMsg::UpdateLobby {
+                    class: lp.class,
+                    display: lp.display,
+                    race: lp.race,
+                    sex: lp.sex,
+                    ready: net.local_ready,
+                });
+            }
+        }
+    }
+}
+
 /// Build the screen into [`MenuRoot`] once the archives are readable, so the glue art is there.
 pub(super) fn build_menu(
     mut commands: Commands,
@@ -158,6 +233,7 @@ pub(super) fn build_menu(
             ));
         }
         zone_frame(ui, &art, f);
+        lobby_frame(ui, &art, f);
 
         // `CharSelectCharacterName`, GlueFontNormalHuge at BOTTOM (0,100).
         ui.spawn(Node {
@@ -183,6 +259,20 @@ pub(super) fn build_menu(
                 1.0,
             );
         });
+        // Multiplayer action hint above Enter World.
+        ui.spawn(Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(84.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
+            ..default()
+        })
+        .with_children(|c| {
+            c.spawn((
+                LobbyHintText,
+                text_bundle(f, "", 13.0, Color::srgb(0.75, 0.88, 1.0)),
+            ));
+        });
         // `CharSelectEnterWorldButton`, 200×60 at BOTTOM (0,30).
         ui.spawn(Node {
             position_type: PositionType::Absolute,
@@ -204,6 +294,136 @@ pub(super) fn build_menu(
                 1.0,
             );
         });
+    });
+}
+
+/// Top-centre LAN / ZeroTier / Tailscale Co-op Lobby panel.
+fn lobby_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
+    let px = Val::Px;
+    ui.spawn(Node {
+        position_type: PositionType::Absolute,
+        left: Val::Percent(50.0),
+        top: px(12.0),
+        margin: UiRect::left(px(-210.0)),
+        width: px(420.0),
+        flex_direction: FlexDirection::Column,
+        padding: UiRect::axes(px(14.0), px(10.0)),
+        row_gap: px(6.0),
+        border: UiRect::all(px(1.5)),
+        border_radius: BorderRadius::all(px(6.0)),
+        ..default()
+    })
+    .insert((
+        BackgroundColor(FRAME_FILL),
+        BorderColor::all(Color::srgb(0.55, 0.45, 0.25)),
+    ))
+    .with_children(|panel| {
+        // Header & status
+        panel
+            .spawn(Node {
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|top| {
+                top.spawn(text_bundle(
+                    f,
+                    "LAN / ZeroTier / Tailscale Co-op",
+                    14.0,
+                    GOLD,
+                ));
+                top.spawn((
+                    LobbyStatusText,
+                    text_bundle(f, "Offline (Solo)", 12.0, Color::srgb(0.75, 0.75, 0.75)),
+                ));
+            });
+
+        // IP Input + Host / Join / Leave row
+        panel
+            .spawn(Node {
+                width: Val::Percent(100.0),
+                column_gap: px(6.0),
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|row| {
+                // Clickable IP input box
+                row.spawn((
+                    LobbyIpBox,
+                    MenuAction::FocusIp,
+                    Button,
+                    Node {
+                        width: px(168.0),
+                        height: px(28.0),
+                        padding: UiRect::axes(px(8.0), px(4.0)),
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::all(px(4.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.03, 0.03, 0.05, 0.95)),
+                    BorderColor::all(Color::srgb(0.45, 0.45, 0.5)),
+                ))
+                .with_children(|box_node| {
+                    box_node.spawn((
+                        LobbyIpText,
+                        text_bundle(f, "127.0.0.1:25565", 13.0, Color::WHITE),
+                    ));
+                });
+
+                glue_button(
+                    row,
+                    art,
+                    f,
+                    MenuAction::HostGame,
+                    "Host LAN",
+                    74.0,
+                    28.0,
+                    GlueBtnKind::Small,
+                    1.0,
+                );
+                glue_button(
+                    row,
+                    art,
+                    f,
+                    MenuAction::JoinGame,
+                    "Join IP",
+                    70.0,
+                    28.0,
+                    GlueBtnKind::Small,
+                    1.0,
+                );
+                glue_button(
+                    row,
+                    art,
+                    f,
+                    MenuAction::LeaveNet,
+                    "Leave",
+                    62.0,
+                    28.0,
+                    GlueBtnKind::Small,
+                    1.0,
+                );
+            });
+
+        // 4-Player Party Roster
+        panel
+            .spawn(Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(2.0),
+                padding: UiRect::top(px(2.0)),
+                ..default()
+            })
+            .with_children(|roster| {
+                for i in 0..MAX_PLAYERS {
+                    roster.spawn((
+                        LobbySlotText(i),
+                        text_bundle(f, "", 12.0, Color::srgb(0.65, 0.65, 0.65)),
+                    ));
+                }
+            });
     });
 }
 
@@ -518,6 +738,82 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     });
 }
 
+/// Handle typing an IP:Port / Tailscale / ZeroTier address when the IP box is focused.
+pub(super) fn lobby_text_input(
+    phase: Res<State<Phase>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut net: ResMut<NetSession>,
+) {
+    if *phase.get() != Phase::Menu || !net.ip_focused {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Enter) {
+        net.ip_focused = false;
+        return;
+    }
+    if keys.just_pressed(KeyCode::Backspace) {
+        net.ip_input.pop();
+    }
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let table: &[(KeyCode, char, char)] = &[
+        (KeyCode::Digit0, '0', ')'),
+        (KeyCode::Digit1, '1', '!'),
+        (KeyCode::Digit2, '2', '@'),
+        (KeyCode::Digit3, '3', '#'),
+        (KeyCode::Digit4, '4', '$'),
+        (KeyCode::Digit5, '5', '%'),
+        (KeyCode::Digit6, '6', '^'),
+        (KeyCode::Digit7, '7', '&'),
+        (KeyCode::Digit8, '8', '*'),
+        (KeyCode::Digit9, '9', '('),
+        (KeyCode::Numpad0, '0', '0'),
+        (KeyCode::Numpad1, '1', '1'),
+        (KeyCode::Numpad2, '2', '2'),
+        (KeyCode::Numpad3, '3', '3'),
+        (KeyCode::Numpad4, '4', '4'),
+        (KeyCode::Numpad5, '5', '5'),
+        (KeyCode::Numpad6, '6', '6'),
+        (KeyCode::Numpad7, '7', '7'),
+        (KeyCode::Numpad8, '8', '8'),
+        (KeyCode::Numpad9, '9', '9'),
+        (KeyCode::Period, '.', '.'),
+        (KeyCode::NumpadDecimal, '.', '.'),
+        (KeyCode::Semicolon, ':', ':'),
+        (KeyCode::Minus, '-', '_'),
+        (KeyCode::KeyA, 'a', 'A'),
+        (KeyCode::KeyB, 'b', 'B'),
+        (KeyCode::KeyC, 'c', 'C'),
+        (KeyCode::KeyD, 'd', 'D'),
+        (KeyCode::KeyE, 'e', 'E'),
+        (KeyCode::KeyF, 'f', 'F'),
+        (KeyCode::KeyG, 'g', 'G'),
+        (KeyCode::KeyH, 'h', 'H'),
+        (KeyCode::KeyI, 'i', 'I'),
+        (KeyCode::KeyJ, 'j', 'J'),
+        (KeyCode::KeyK, 'k', 'K'),
+        (KeyCode::KeyL, 'l', 'L'),
+        (KeyCode::KeyM, 'm', 'M'),
+        (KeyCode::KeyN, 'n', 'N'),
+        (KeyCode::KeyO, 'o', 'O'),
+        (KeyCode::KeyP, 'p', 'P'),
+        (KeyCode::KeyQ, 'q', 'Q'),
+        (KeyCode::KeyR, 'r', 'R'),
+        (KeyCode::KeyS, 's', 'S'),
+        (KeyCode::KeyT, 't', 'T'),
+        (KeyCode::KeyU, 'u', 'U'),
+        (KeyCode::KeyV, 'v', 'V'),
+        (KeyCode::KeyW, 'w', 'W'),
+        (KeyCode::KeyX, 'x', 'X'),
+        (KeyCode::KeyY, 'y', 'Y'),
+        (KeyCode::KeyZ, 'z', 'Z'),
+    ];
+    for &(code, lo, hi) in table {
+        if keys.just_pressed(code) && net.ip_input.len() < 42 {
+            net.ip_input.push(if shift { hi } else { lo });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn menu_clicks(
     clicks: Res<GlueClicks>,
@@ -526,6 +822,7 @@ pub(super) fn menu_clicks(
     creatures: Option<Res<crate::entities::Creatures>>,
     mut selection: ResMut<Selection>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
     mut rng: ResMut<Rng>,
     mut next: ResMut<NextState<Phase>>,
 ) {
@@ -542,6 +839,9 @@ pub(super) fn menu_clicks(
     else {
         return;
     };
+    if action != MenuAction::FocusIp {
+        net.ip_focused = false;
+    }
     let all = all_looks(creatures);
     let cur = selection
         .look
@@ -549,16 +849,49 @@ pub(super) fn menu_clicks(
         .map(|&(_, r, s)| (r, s));
     let (race, sex) = (cur.map(|c| c.0), cur.map_or(0, |c| c.1));
     match action {
+        MenuAction::FocusIp => {
+            net.ip_focused = !net.ip_focused;
+            return;
+        }
+        MenuAction::HostGame => {
+            let lp = local_lobby_player(&selection, &net);
+            let bind = format!("0.0.0.0:{DEFAULT_PORT}");
+            net.start_host(&bind, lp);
+            return;
+        }
+        MenuAction::JoinGame => {
+            let lp = local_lobby_player(&selection, &net);
+            let addr = net.ip_input.trim().to_string();
+            if !addr.is_empty() {
+                net.start_client(&addr, lp);
+            }
+            return;
+        }
+        MenuAction::LeaveNet => {
+            net.disconnect();
+            return;
+        }
         MenuAction::Map(i) => {
+            // Clients follow the Host's chosen zone.
+            if net.is_client() {
+                return;
+            }
             if selection.map != i {
                 selection.map = i;
                 selection.version += 1;
+                if let Some(host) = &net.host {
+                    host.broadcast_reliable(&ReliableMsg::LobbyState {
+                        map: selection.map,
+                        players: net.lobby_players.clone(),
+                    });
+                }
             }
         }
         MenuAction::Enter => {
-            if start_run(&mut run, &mut selection) {
+            if start_run_with_net(&mut run, &mut selection, &mut net, &mut rng) {
                 next.set(Phase::Playing);
             }
+            return;
         }
         MenuAction::Randomize => {
             let picks: Vec<(usize, usize)> = all
@@ -602,13 +935,15 @@ pub(super) fn menu_clicks(
         }
     }
     save_pick(&selection);
+    sync_local_pick_to_net(&selection, &mut net);
 }
 
 /// The screen's per-frame state: the locked highlights, hover labels, which races and classes
-/// the pick allows, the gender on the race faces, the name line and Enter World.
+/// the pick allows, the gender on the race faces, the name line, the LAN lobby panel, and Enter World.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn refresh_menu_ui(
     selection: Res<Selection>,
+    net: Res<NetSession>,
     creatures: Option<Res<crate::entities::Creatures>>,
     art: Res<GlueArt>,
     mut buttons: Query<(
@@ -620,9 +955,16 @@ pub(super) fn refresh_menu_ui(
         &mut Node,
         &mut Visibility,
     )>,
+    mut ip_box: Query<&mut BorderColor, With<LobbyIpBox>>,
     mut labels: Query<&mut Visibility, (With<HoverLabel>, Without<MenuAction>)>,
     mut faces: Query<(&RaceFace, &mut ImageNode)>,
-    mut name: Query<(&mut Text, &mut TextColor), With<PickName>>,
+    mut texts: ParamSet<(
+        Query<(&mut Text, &mut TextColor), With<PickName>>,
+        Query<(&mut Text, &mut TextColor), With<LobbyStatusText>>,
+        Query<&mut Text, With<LobbyIpText>>,
+        Query<(&LobbySlotText, &mut Text, &mut TextColor)>,
+        Query<(&mut Text, &mut TextColor), With<LobbyHintText>>,
+    )>,
     mut cache: Local<(Option<u32>, bool, Vec<Vec<(u32, u8, u8)>>)>,
 ) {
     let have = creatures.is_some();
@@ -639,13 +981,15 @@ pub(super) fn refresh_menu_ui(
         .and_then(|i| selection.looks.get(i))
         .map(|&(_, r, s)| (r, s));
 
+    let all_ready = !net.lobby_players.is_empty() && net.lobby_players.iter().all(|p| p.ready);
+
     for (action, interaction, children, lock, disabled, mut node, mut vis) in &mut buttons {
         let selected = match *action {
             MenuAction::Race(r) => cur.is_some_and(|c| c.0 == r),
             MenuAction::Sex(s) => cur.is_some_and(|c| c.1 == s),
             MenuAction::Class(i) => selection.class == Some(i),
             MenuAction::Map(i) => selection.map == i,
-            MenuAction::Randomize | MenuAction::Enter => false,
+            _ => false,
         };
         if let Some(mut lock) = lock {
             if lock.0 != selected {
@@ -653,7 +997,13 @@ pub(super) fn refresh_menu_ui(
             }
         }
         if let Some(mut disabled) = disabled {
-            let off = *action == MenuAction::Enter && cur.is_none();
+            let off = match *action {
+                MenuAction::Enter => {
+                    cur.is_none() || (net.role == NetRole::Host && !all_ready)
+                }
+                MenuAction::LeaveNet => !net.is_online(),
+                _ => false,
+            };
             if disabled.0 != off {
                 disabled.0 = off;
             }
@@ -697,6 +1047,14 @@ pub(super) fn refresh_menu_ui(
         }
     }
 
+    if let Ok(mut bc) = ip_box.single_mut() {
+        *bc = BorderColor::all(if net.ip_focused {
+            GOLD
+        } else {
+            Color::srgb(0.45, 0.45, 0.5)
+        });
+    }
+
     if let (Some((_, size)), Some((_, sex))) = (&art.races, cur) {
         for (face, mut img) in &mut faces {
             if let Some(tc) = race_tc(face.0, sex) {
@@ -709,7 +1067,7 @@ pub(super) fn refresh_menu_ui(
     }
 
     let class = selection.class_def();
-    if let Ok((mut t, mut color)) = name.single_mut() {
+    if let Ok((mut t, mut color)) = texts.p0().single_mut() {
         let want = match (class, cur) {
             (Some(c), Some((r, _))) => format!("{} {}", race_name(r), c.name),
             _ => String::new(),
@@ -722,5 +1080,119 @@ pub(super) fn refresh_menu_ui(
         if color.0 != want {
             color.0 = want;
         }
+    }
+
+    // Update Lobby Status Text
+    if let Ok((mut t, mut tc)) = texts.p1().single_mut() {
+        if t.0 != net.status_text {
+            t.0.clone_from(&net.status_text);
+        }
+        tc.0 = match net.role {
+            NetRole::Offline => Color::srgb(0.7, 0.7, 0.7),
+            NetRole::Host => Color::srgb(0.3, 0.95, 0.4),
+            NetRole::Client => Color::srgb(0.4, 0.85, 1.0),
+        };
+    }
+
+    // Update IP Input Text
+    if let Ok(mut t) = texts.p2().single_mut() {
+        let caret = if net.ip_focused { "|" } else { "" };
+        let want = format!("{}{caret}", net.ip_input);
+        if t.0 != want {
+            t.0 = want;
+        }
+    }
+
+    // Update 4-Slot Party Roster
+    for (slot, mut t, mut tc) in &mut texts.p3() {
+        let i = slot.0;
+        if !net.is_online() {
+            let want = if i == 0 {
+                "Solo Mode — Click 'Host LAN' to host or enter ZeroTier/Tailscale IP & 'Join IP'"
+                    .to_string()
+            } else {
+                String::new()
+            };
+            if t.0 != want {
+                t.0 = want;
+            }
+            tc.0 = Color::srgb(0.65, 0.65, 0.65);
+            continue;
+        }
+        if let Some(lp) = net.lobby_players.get(i) {
+            let cls = &data::CLASSES[lp.class.min(data::CLASSES.len() - 1)];
+            let badge = if lp.ready { "[READY]" } else { "[WAIT] " };
+            let role_tag = if lp.id == 0 {
+                " (Host)"
+            } else if lp.id == net.local_id {
+                " (You)"
+            } else {
+                ""
+            };
+            let want = format!(
+                "{}. {badge} {}{} — {} {}",
+                i + 1,
+                lp.name,
+                role_tag,
+                race_name(lp.race),
+                cls.name
+            );
+            if t.0 != want {
+                t.0 = want;
+            }
+            tc.0 = if lp.ready {
+                rgb(cls.color)
+            } else {
+                Color::srgb(0.75, 0.75, 0.75)
+            };
+        } else {
+            let want = format!("{}. [Open Party Slot]", i + 1);
+            if t.0 != want {
+                t.0 = want;
+            }
+            tc.0 = Color::srgb(0.42, 0.42, 0.45);
+        }
+    }
+
+    // Update Bottom Hint above Enter World button
+    if let Ok((mut t, mut tc)) = texts.p4().single_mut() {
+        let (want, col) = match net.role {
+            NetRole::Offline => (String::new(), Color::WHITE),
+            NetRole::Host => {
+                if all_ready {
+                    (
+                        format!(
+                            "All {} party member(s) READY — Press Enter World to launch!",
+                            net.lobby_players.len()
+                        ),
+                        Color::srgb(0.35, 1.0, 0.45),
+                    )
+                } else {
+                    (
+                        "Waiting for all party members to click Ready...".to_string(),
+                        GOLD,
+                    )
+                }
+            }
+            NetRole::Client => {
+                if net.local_ready {
+                    (
+                        "You are READY! Waiting for Host to Enter World (Click button to unready)"
+                            .to_string(),
+                        Color::srgb(0.35, 1.0, 0.45),
+                    )
+                } else {
+                    (
+                        "Pick your Race & Class, then click 'Enter World' below to mark READY!"
+                            .to_string(),
+                        GOLD,
+                    )
+                }
+            }
+        };
+        if t.0 != want {
+            t.0 = want;
+        }
+        tc.0 = col;
     }
 }

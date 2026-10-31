@@ -9,6 +9,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::data::{self, Kind};
 use super::fill::FillMaterial;
 use super::hud::{self, Choice, HudFont, Offer, SpellIcon};
+use super::net::NetSession;
 use super::{Phase, Rng, Run};
 
 /// WoW's item-quality colours (`ITEM_QUALITY_COLORS`).
@@ -110,7 +111,9 @@ pub(super) fn rarity(choice: Choice, run: &Run) -> Rarity {
     match choice {
         Choice::NewAbility(def) => spell_tier(def, run),
         Choice::Upgrade(k) => {
-            let o = &run.abilities[k];
+            let Some(o) = run.abilities.get(k) else {
+                return Rarity::Uncommon;
+            };
             let next = o.level + 1;
             let targets = [3, 5, 7].contains(&next)
                 && matches!(
@@ -126,7 +129,7 @@ pub(super) fn rarity(choice: Choice, run: &Run) -> Rarity {
             }
         }
         Choice::NewPassive(_) => Rarity::Uncommon,
-        Choice::UpPassive(k) => match run.passives[k].1 + 1 {
+        Choice::UpPassive(k) => match run.passives.get(k).map_or(2, |p| p.1 + 1) {
             n if n == data::MAX_PASSIVE_LEVEL => Rarity::Epic,
             n if n + 1 == data::MAX_PASSIVE_LEVEL => Rarity::Rare,
             2 => Rarity::Common,
@@ -404,8 +407,10 @@ pub(super) fn animate_cards(
     )>,
     mut shines: Query<(&CardShine, &mut Node)>,
     mut rays: Query<&mut UiTransform, (With<Rays>, Without<Card>)>,
+    mut sub: Query<&mut Text, With<hud::LevelUpSub>>,
     mut pending: ResMut<PendingPick>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
     mut offer: ResMut<Offer>,
     mut rng: ResMut<Rng>,
     mut next: ResMut<NextState<Phase>>,
@@ -414,12 +419,30 @@ pub(super) fn animate_cards(
         pending.0 = None;
         return;
     }
+    if let Ok(mut text) = sub.single_mut() {
+        let want = if net.is_online() {
+            let total = net.player_count();
+            let ready = net.levelup_picked.len();
+            if net.levelup_picked.contains(&net.local_id) {
+                format!("Choice locked in! Waiting for party ({ready}/{total})...")
+            } else {
+                format!("Choose your power  •  Party ready: {ready}/{total}")
+            }
+        } else {
+            "Choose your power".to_string()
+        };
+        if text.0 != want {
+            text.0 = want;
+        }
+    }
+
     let dt = time.delta_secs().min(0.05);
     let now = time.elapsed_secs();
     for mut r in &mut rays {
         r.rotation = Rot2::radians(now * 0.12);
         r.scale = Vec2::splat(1.0 + 0.03 * (now * 1.7).sin());
     }
+    let already_picked = net.is_online() && net.levelup_picked.contains(&net.local_id);
     let chosen = pending.0.map(|(i, _)| i);
     let mut shine_at = [None::<f32>; 4];
     for (mut card, interaction, cursor, mut tf, mut shadow, mut vis) in &mut cards {
@@ -432,7 +455,10 @@ pub(super) fn animate_cards(
         *vis = Visibility::Inherited;
         let deal = (card.t / DEAL_SECS).clamp(0.0, 1.0);
         let e = ease_out_back(deal);
-        let hot = *interaction != Interaction::None && chosen.is_none() && deal >= 1.0;
+        let hot = *interaction != Interaction::None
+            && chosen.is_none()
+            && !already_picked
+            && deal >= 1.0;
         let k = 1.0 - (-dt * 14.0).exp();
         let hv = card.hover;
         card.hover = hv + ((if hot { 1.0 } else { 0.0 }) - hv) * k;
@@ -500,7 +526,7 @@ pub(super) fn animate_cards(
         if *t >= PICK_SECS {
             let i = *i;
             pending.0 = None;
-            hud::pick(i, &mut run, &mut offer, &mut rng, &mut next);
+            hud::pick(i, &mut run, &mut net, &mut offer, &mut rng, &mut next);
         }
     }
 }
@@ -511,9 +537,13 @@ pub(super) fn choose_card(
     keys: Res<ButtonInput<KeyCode>>,
     cards: Query<(&Card, &Interaction), Changed<Interaction>>,
     offer: Res<Offer>,
+    net: Res<NetSession>,
     mut pending: ResMut<PendingPick>,
 ) {
-    if *phase.get() != Phase::LevelUp || pending.0.is_some() {
+    if *phase.get() != Phase::LevelUp
+        || pending.0.is_some()
+        || (net.is_online() && net.levelup_picked.contains(&net.local_id))
+    {
         return;
     }
     let mut pick = cards

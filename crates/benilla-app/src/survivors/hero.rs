@@ -1,4 +1,5 @@
-//! The hero: its body, WASD movement over the terrain, the top-down camera, and its health.
+//! The hero(es): bodies for the local player and remote party members, WASD movement over the
+//! terrain, top-down / orbit camera, health, downed state, and teammate proximity revival.
 
 use benilla_world::view::WorldCamera;
 use benilla_world::world_point::WorldPoint;
@@ -6,11 +7,13 @@ use bevy::input::mouse::{AccumulatedMouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
 use super::data::{self, ClassDef};
-use super::units::{self, flat, wow_to_bevy, yaw_toward, Fx, Marks, UnitSpec};
+use super::net::{NetRole, NetSession, PlayerId, BTN_JUMP, REVIVE_RADIUS, REVIVE_SECS};
+use super::units::{self, flat, wow_to_bevy, yaw_toward, Fx, Marks, UnitSpec, COLOR_HEAL};
 use super::{Phase, Run, Selection};
 use crate::creature_anim::{move_flags, MovementState};
 use crate::net::{FieldChanged, Guid, ObjectStore};
 
+/// Marker component on the local player's hero entity (`hero.single()` queries this).
 #[derive(Component)]
 pub(super) struct Hero {
     /// Vertical velocity in yards/second while airborne; 0 on the ground.
@@ -21,13 +24,21 @@ pub(super) struct Hero {
     pub(super) air: f32,
 }
 
+/// Present on every party member's hero entity (both the local `Hero` and remote teammates).
+#[derive(Component, Clone, Copy)]
+pub(super) struct PartyHero {
+    pub id: PlayerId,
+    pub vy: f32,
+    pub air: f32,
+}
+
 /// The body radius enemies stop at.
 pub(super) const HERO_RADIUS: f32 = 0.7;
 
 /// The hop's initial upward speed and the gravity that brings it back down — the reference
 /// `CMovement` jump seed and gravity (`player/state.rs`'s `JUMP_SPEED` / `GRAVITY`).
-const JUMP_SPEED: f32 = 7.955_547;
-const GRAVITY: f32 = 19.291_105;
+pub(super) const JUMP_SPEED: f32 = 7.955_547;
+pub(super) const GRAVITY: f32 = 19.291_105;
 
 /// Radians of orbit per raw mouse unit while right-dragging.
 const ORBIT_RATE: f32 = 0.008;
@@ -78,6 +89,17 @@ pub(super) fn arena(map: &data::MapDef) -> Vec3 {
     wow_to_bevy(map.center)
 }
 
+/// Offset around the arena center for party slot `id` so players don't spawn stacked on top of each other.
+pub(super) fn spawn_offset(id: PlayerId) -> Vec3 {
+    match id {
+        0 => Vec3::ZERO,
+        1 => Vec3::new(2.5, 0.0, 0.0),
+        2 => Vec3::new(-2.5, 0.0, 0.0),
+        3 => Vec3::new(0.0, 0.0, 2.5),
+        _ => Vec3::new(0.0, 0.0, -2.5),
+    }
+}
+
 /// The world is the battleground being stood in ([`Selection::stage`]): entering one on another
 /// continent worldports, which raises the loading screen until the new ground is in.
 pub(super) fn follow_map(
@@ -93,9 +115,25 @@ pub(super) fn follow_map(
     }
 }
 
-/// The hero in the class trainer's look, weapons drawn.
+/// Spawn the local player's hero in the class trainer's look, weapons drawn.
 pub(super) fn spawn_hero(
     commands: &mut Commands,
+    class: &'static ClassDef,
+    display: u32,
+    race: u8,
+    sex: u8,
+    serial: u64,
+    pos: Vec3,
+) -> Entity {
+    spawn_party_hero(commands, 0, true, class, display, race, sex, serial, pos)
+}
+
+/// Spawn a party member's hero (`is_local = true` attaches [`Hero`] for camera/input focus).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_party_hero(
+    commands: &mut Commands,
+    id: PlayerId,
+    is_local: bool,
     class: &'static ClassDef,
     display: u32,
     race: u8,
@@ -122,9 +160,17 @@ pub(super) fn spawn_hero(
         pos,
         0.0,
     );
-    commands
-        .entity(e)
-        .insert((Hero { vy: 0.0, air: 0.0 }, Marks::buffs()));
+    commands.entity(e).insert((
+        PartyHero {
+            id,
+            vy: 0.0,
+            air: 0.0,
+        },
+        Marks::buffs(),
+    ));
+    if is_local {
+        commands.entity(e).insert(Hero { vy: 0.0, air: 0.0 });
+    }
     e
 }
 
@@ -195,19 +241,25 @@ pub(super) fn drive_hero(
     aim: Res<AimPoint>,
     world: WorldPoint,
     auto: Option<Res<super::auto::Auto>>,
+    mut net: ResMut<NetSession>,
     mut player: ResMut<crate::player::Player>,
-    mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero)>,
+    mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero, Option<&mut PartyHero>)>,
 ) {
+    let local_down = run
+        .player(net.local_id)
+        .is_some_and(|c| c.is_down())
+        || run.dead_t.is_some();
+
     let focus = match hero.single_mut() {
-        Ok((mut tf, mut mv, mut hm)) => {
+        Ok((mut tf, mut mv, mut hm, mut ph)) => {
             let dt = time.delta_secs();
             let mut dir = Vec3::ZERO;
             if let Some(auto) = auto
                 .as_deref()
-                .filter(|_| *phase.get() == Phase::Playing && run.dead_t.is_none())
+                .filter(|_| *phase.get() == Phase::Playing && !local_down)
             {
                 dir = super::auto::steer(auto);
-            } else if *phase.get() == Phase::Playing && run.dead_t.is_none() {
+            } else if *phase.get() == Phase::Playing && !local_down {
                 if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
                     dir.z -= 1.0;
                 }
@@ -232,11 +284,11 @@ pub(super) fn drive_hero(
             let face = (rig.mode == CamMode::Fixed
                 && auto.is_none()
                 && *phase.get() == Phase::Playing
-                && run.dead_t.is_none())
-            .then(|| aim.0.map(|a| flat(a - pos)))
-            .flatten()
-            .filter(|d| d.length() > 0.5)
-            .map(|d| d.normalize());
+                && !local_down)
+                .then(|| aim.0.map(|a| flat(a - pos)))
+                .flatten()
+                .filter(|d| d.length() > 0.5)
+                .map(|d| d.normalize());
             if let Some(look) = face {
                 let target = Quat::from_rotation_y(yaw_toward(look));
                 tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
@@ -263,17 +315,18 @@ pub(super) fn drive_hero(
             let off = flat(pos - center);
             if off.length() > map.leash * 2.0 {
                 // Just entered another battleground: start at its centre.
-                pos = center;
+                pos = center + spawn_offset(net.local_id);
             } else if off.length() > map.leash {
                 let held = center + off.normalize() * map.leash;
                 pos.x = held.x;
                 pos.z = held.z;
             }
             let ground = world.terrain_height_under(pos).unwrap_or(pos.y);
-            let playing = *phase.get() == Phase::Playing && run.dead_t.is_none();
+            let playing = *phase.get() == Phase::Playing && !local_down;
             // Space hops: lift off the terrain, then gravity brings the hero back down.
             if playing && keys.just_pressed(KeyCode::Space) && hm.vy == 0.0 && hm.air == 0.0 {
                 hm.vy = JUMP_SPEED;
+                net.latched_buttons |= BTN_JUMP;
             }
             if playing && (hm.vy != 0.0 || hm.air > 0.0) {
                 hm.vy -= GRAVITY * dt;
@@ -287,6 +340,10 @@ pub(super) fn drive_hero(
                 hm.vy = 0.0;
             }
             pos.y = ground + hm.air;
+            if let Some(ref mut ph) = ph {
+                ph.vy = hm.vy;
+                ph.air = hm.air;
+            }
             // Feed the animation driver: `vertical_speed`'s sign and the `FALLING` flag are what
             // select the Jump (37/38) / Fall (40) animation (`creature_anim::select`).
             mv.vertical_speed = hm.vy;
@@ -314,11 +371,7 @@ pub(super) fn drive_hero(
     player.pos = focus;
 }
 
-/// Let go of the mouse buttons when the page loses focus or the pointer leaves it. A release that
-/// lands elsewhere (alt-tab mid-drag, a browser or OS popup) never reaches the game, so the button
-/// would read as held and the unlocked camera would swing with every move until both buttons were
-/// clicked again. Survivors only: the engine's mouse-look keeps its buttons across a deactivate,
-/// as 1.12.1 does.
+/// Let go of the mouse buttons when the page loses focus or the pointer leaves it.
 pub(super) fn drop_stray_buttons(
     mut focus: MessageReader<bevy::window::WindowFocused>,
     mut left: MessageReader<bevy::window::CursorLeft>,
@@ -344,8 +397,6 @@ pub(super) fn place_camera(
     hero: Query<&Transform, (With<Hero>, Without<WorldCamera>)>,
     mut cams: Query<&mut Transform, With<WorldCamera>>,
 ) {
-    // `C` unlocks the camera to swing and tilt; locking it again snaps back to the top-down view,
-    // so world-relative WASD lines up with the screen again.
     if keys.just_pressed(KeyCode::KeyC) {
         rig.mode = match rig.mode {
             CamMode::Fixed => CamMode::Orbit,
@@ -356,10 +407,7 @@ pub(super) fn place_camera(
             }
         };
     }
-    // With no hero yet, the focus `drive_hero` grounded.
     let focus = hero.single().map_or(player.pos, |t| t.translation);
-    // Multiplicative, so a notch moves as far by eye close in as far out; all the way down to an
-    // over-the-shoulder view.
     for w in wheel.read() {
         let notches = match w.unit {
             MouseScrollUnit::Line => w.y,
@@ -375,7 +423,6 @@ pub(super) fn place_camera(
             focus + Vec3::Y * 1.1,
         )
     } else {
-        // Unlocked, either mouse button drags the camera around the hero, as in WoW.
         if rig.mode == CamMode::Orbit && mouse.any_pressed([MouseButton::Left, MouseButton::Right])
         {
             rig.yaw -= motion.delta.x * ORBIT_RATE;
@@ -385,7 +432,6 @@ pub(super) fn place_camera(
         let (sp, cp) = rig.pitch.sin_cos();
         let look = focus + Vec3::Y * 1.4;
         let mut eye = look + Vec3::new(cp * sy, sp, cp * cy) * rig.dist;
-        // Never under the ground: a low tilt on a slope would bury the lens.
         if let Some(h) = world.terrain_height_under(eye) {
             eye.y = eye.y.max(h + 0.6);
         }
@@ -397,8 +443,22 @@ pub(super) fn place_camera(
     }
 }
 
-/// Damage the hero takes from one blow, after immunity, armour and the shield; returns what got
-/// through.
+/// Damage a specific party member takes from one blow, after immunity, armour and shield.
+pub(super) fn hurt_combatant(c: &mut super::Combatant, raw: f32) -> f32 {
+    if c.immune_t > 0.0 || c.is_down() {
+        return 0.0;
+    }
+    let mut dmg = (raw - c.stats().armor).max(1.0);
+    if c.shield_t > 0.0 && c.shield > 0.0 {
+        let absorbed = dmg.min(c.shield);
+        c.shield -= absorbed;
+        dmg -= absorbed;
+    }
+    c.hp = (c.hp - dmg).max(0.0);
+    dmg
+}
+
+/// Damage the local hero takes (singleplayer fallback / sync helper).
 pub(super) fn hurt_hero(run: &mut Run, raw: f32) -> f32 {
     if run.immune_t > 0.0 || run.dead_t.is_some() {
         return 0.0;
@@ -409,88 +469,218 @@ pub(super) fn hurt_hero(run: &mut Run, raw: f32) -> f32 {
         run.shield -= absorbed;
         dmg -= absorbed;
     }
-    run.hp -= dmg;
+    run.hp = (run.hp - dmg).max(0.0);
     dmg
 }
 
-/// The clock, regeneration, the timed buffs and their visuals, death and victory.
+/// The clock, regeneration, timed buffs & state visuals, downed state, teammate proximity revive,
+/// party wipe death, and victory.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hero_vitals(
     time: Res<Time>,
     mut run: ResMut<Run>,
+    mut net: ResMut<NetSession>,
     mut next: ResMut<NextState<Phase>>,
-    mut hero: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks), With<Hero>>,
+    mut party_heroes: Query<(Entity, &PartyHero, &Transform, &Guid, &mut ObjectStore, &mut Marks)>,
     mut fields: MessageWriter<FieldChanged>,
     mut fx: Fx,
 ) {
-    let dt = time.delta_secs();
-    let stats = run.stats();
-    let Ok((entity, guid, mut store, mut marks)) = hero.single_mut() else {
+    if net.is_client() {
         return;
-    };
+    }
+    let dt = time.delta_secs();
     if let Some(t) = run.dead_t.as_mut() {
         *t += dt;
         if *t > 3.0 {
             next.set(Phase::GameOver);
+            if let Some(host) = &net.host {
+                host.broadcast_reliable(&super::net::ReliableMsg::SetPhase {
+                    phase: super::net::NetPhase::GameOver,
+                    won: false,
+                });
+            }
         }
         return;
     }
-    run.elapsed += dt;
-    let r = &mut *run;
-    for t in [&mut r.shield_t, &mut r.immune_t, &mut r.thorns_t] {
-        *t = (*t - dt).max(0.0);
-    }
-    let mut heal = stats.regen * dt;
-    if run.heal_t > 0.0 {
-        heal += run.heal_rate * dt.min(run.heal_t);
-        run.heal_t = (run.heal_t - dt).max(0.0);
-    }
-    run.hp = (run.hp + heal).min(stats.max_hp);
 
-    // The buffs show as their own state kits: the shield bubble, the immunity glow, the orbs.
-    let mut shown: Vec<u32> = Vec::new();
-    if run.shield_t > 0.0 && run.shield > 0.0 {
-        shown.push(17);
+    run.elapsed += dt;
+
+    // If `run.players` is empty (e.g. legacy singleplayer path), keep top-level `run` synced into slot 0.
+    if run.players.is_empty() {
+        let c = super::Combatant::new(0, "Hero".into(), run.class, 1300, run.race, 0);
+        run.players.push(c);
+        let local_id = net.local_id;
+        run.sync_combatant_from_local(local_id);
+    } else if net.role == NetRole::Offline {
+        let local_id = net.local_id;
+        run.sync_combatant_from_local(local_id);
     }
-    if run.immune_t > 0.0 {
-        shown.push(642);
-    }
-    if run.thorns_t > 0.0 {
-        shown.push(run.thorns_spell);
-    }
-    if run.heal_t > 0.0 {
-        shown.push(774);
-    }
-    for owned in &run.abilities {
-        if owned.def.key == "lightning_shield" {
-            shown.push(owned.def.spell);
+
+    // Gather positions of all party heroes for proximity revive checks.
+    let positions: Vec<(PlayerId, Entity, Vec3)> = party_heroes
+        .iter()
+        .map(|(e, ph, tf, ..)| (ph.id, e, tf.translation))
+        .collect();
+
+    let multi = run.players.len() > 1;
+    let mut newly_downed: Vec<String> = Vec::new();
+    let mut newly_revived: Vec<(PlayerId, String)> = Vec::new();
+
+    // First pass: tick vitals, buffs, and check downed status.
+    for i in 0..run.players.len() {
+        let stats = run.players[i].stats();
+        let c = &mut run.players[i];
+        if c.is_down() {
+            continue;
+        }
+        for t in [&mut c.shield_t, &mut c.immune_t, &mut c.thorns_t] {
+            *t = (*t - dt).max(0.0);
+        }
+        let mut heal = stats.regen * dt;
+        if c.heal_t > 0.0 {
+            heal += c.heal_rate * dt.min(c.heal_t);
+            c.heal_t = (c.heal_t - dt).max(0.0);
+        }
+        c.hp = (c.hp + heal).min(stats.max_hp);
+        if c.hp <= 0.0 {
+            c.hp = 0.0;
+            c.downed_revive = Some(0.0);
+            c.shield = 0.0;
+            c.shield_t = 0.0;
+            c.thorns_t = 0.0;
+            c.heal_t = 0.0;
+            if multi {
+                newly_downed.push(c.name.clone());
+            }
         }
     }
-    if run.passives.iter().any(|(p, _)| p.key == "renew") {
-        shown.push(139);
-    }
-    marks.set(&shown);
-    marks.flush(entity, guid.0, &mut store, &mut fields);
 
-    if run.hp <= 0.0 {
+    // Second pass: check proximity revives for downed players when at least one teammate is alive.
+    if multi {
+        let alive_positions: Vec<(PlayerId, Vec3)> = positions
+            .iter()
+            .filter(|&&(id, _, _)| run.player(id).is_some_and(|c| !c.is_down()))
+            .map(|&(id, _, pos)| (id, pos))
+            .collect();
+
+        for c in &mut run.players {
+            let max_hp = c.stats().max_hp;
+            if let Some(ref mut progress) = c.downed_revive {
+                let my_pos = positions
+                    .iter()
+                    .find(|&&(id, _, _)| id == c.id)
+                    .map(|&(_, _, p)| p);
+                let rescuer_near = my_pos.is_some_and(|mp| {
+                    alive_positions
+                        .iter()
+                        .any(|&(_, ap)| flat(ap - mp).length() <= REVIVE_RADIUS)
+                });
+                if rescuer_near {
+                    *progress += dt;
+                    if *progress >= REVIVE_SECS {
+                        c.downed_revive = None;
+                        c.hp = max_hp * 0.5;
+                        c.immune_t = 3.0;
+                        newly_revived.push((c.id, c.name.clone()));
+                    }
+                } else {
+                    *progress = (*progress - dt * 0.5).max(0.0);
+                }
+            }
+        }
+    }
+
+    // Update unit visual state (death pose vs live pose + aura marks) on each party hero entity.
+    for (entity, ph, _, guid, mut store, mut marks) in &mut party_heroes {
+        let Some(c) = run.player(ph.id) else { continue };
+        if c.is_down() {
+            units::kill_unit(&mut store);
+            marks.clear();
+            marks.flush(entity, guid.0, &mut store, &mut fields);
+        } else {
+            units::revive_unit(&mut store);
+            let mut shown: Vec<u32> = Vec::new();
+            if c.shield_t > 0.0 && c.shield > 0.0 {
+                shown.push(17);
+            }
+            if c.immune_t > 0.0 {
+                shown.push(642);
+            }
+            if c.thorns_t > 0.0 {
+                shown.push(c.thorns_spell);
+            }
+            if c.heal_t > 0.0 {
+                shown.push(774);
+            }
+            for owned in &c.abilities {
+                if owned.def.key == "lightning_shield" {
+                    shown.push(owned.def.spell);
+                }
+            }
+            if c.passives.iter().any(|(p, _)| p.key == "renew") {
+                shown.push(139);
+            }
+            marks.set(&shown);
+            marks.flush(entity, guid.0, &mut store, &mut fields);
+        }
+    }
+
+    for (rev_id, rev_name) in newly_revived {
+        let msg = format!("{rev_name} has been revived!");
+        run.banner = Some((msg.clone(), 3.0));
+        if let Some(host) = &net.host {
+            host.broadcast_reliable(&super::net::ReliableMsg::Banner {
+                text: msg,
+                secs: 3.0,
+            });
+        }
+        if let Some(&(_, ent, _)) = positions.iter().find(|&&(id, _, _)| id == rev_id) {
+            fx.cast(&mut net, ent, 2006, &[ent], None);
+            if let Some(c) = run.player(rev_id) {
+                fx.number(&mut net, ent, c.hp, false, COLOR_HEAL);
+            }
+        }
+    }
+
+    for down_name in newly_downed {
+        let msg = format!("{down_name} is down! Stand nearby to revive!");
+        run.banner = Some((msg.clone(), 3.5));
+        if let Some(host) = &net.host {
+            host.broadcast_reliable(&super::net::ReliableMsg::Banner {
+                text: msg,
+                secs: 3.5,
+            });
+        }
+    }
+
+    // Sync local player's combatant back to top-level `Run` fields for HUD.
+    let local_id = net.local_id;
+    run.sync_local_from_combatant(local_id);
+
+    // Check if ALL party members are down -> Wipe (GameOver after 3s death animation).
+    let all_down = !run.players.is_empty() && run.players.iter().all(|c| c.is_down());
+    if all_down {
         run.hp = 0.0;
         run.dead_t = Some(0.0);
-        units::kill_unit(&mut store);
-        marks.clear();
-        marks.flush(entity, guid.0, &mut store, &mut fields);
     } else if run.elapsed >= data::VICTORY_SECS {
         run.won = true;
-        // A last flourish before the results.
-        fx.cast(entity, 642, &[entity], None);
+        for &(_, ent, _) in &positions {
+            fx.cast(&mut net, ent, 642, &[ent], None);
+        }
         next.set(Phase::GameOver);
+        if let Some(host) = &net.host {
+            host.broadcast_reliable(&super::net::ReliableMsg::SetPhase {
+                phase: super::net::NetPhase::GameOver,
+                won: true,
+            });
+        }
     }
 }
 
-/// The ground-plane distance from the hero, the measure every range in the mode uses.
 /// The movement flags for running `dir` while facing `look`: forward, backpedal or strafe, by
 /// which quarter the run falls in, so the walk, backpedal and strafe animations play.
-fn gait(look: Vec3, dir: Vec3) -> u32 {
+pub(super) fn gait(look: Vec3, dir: Vec3) -> u32 {
     let ahead = look.dot(dir);
-    // Positive when `dir` is to the hero's left: WoW faces −Z with +X on the right.
     let left = look.cross(dir).y;
     let quarter = std::f32::consts::FRAC_1_SQRT_2;
     if ahead >= quarter {

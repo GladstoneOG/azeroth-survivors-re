@@ -1137,6 +1137,10 @@ pub(super) fn start_run_with_net(
                 ..Run::default()
             };
             run.sync_local_from_combatant(net.local_id);
+            net.all_loaded = false;
+            net.loaded_players.clear();
+            net.sent_loaded = false;
+            net.my_locked_card = None;
             if let Some(host) = &net.host {
                 host.broadcast_reliable(&ReliableMsg::StartRun {
                     map: selection.map,
@@ -1289,9 +1293,12 @@ pub(super) fn roll_and_broadcast_offers(
 ) {
     net.levelup_picked.clear();
     net.host_offers.clear();
+    net.my_locked_card = None;
     let mut wire_offers: HashMap<PlayerId, Vec<NetCardChoice>> = HashMap::new();
     for c in &run.players {
-        let ch = choices_for_combatant(c, rng);
+        let mut combatant_rng =
+            Rng(rng.next_u64() ^ ((c.id as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)));
+        let ch = choices_for_combatant(c, &mut combatant_rng);
         wire_offers.insert(
             c.id,
             ch.iter().copied().map(|choice| choice_to_net(c, choice)).collect(),
@@ -1392,6 +1399,7 @@ pub(super) fn apply_player_card_pick(
     }
 
     run.pending_levels = run.pending_levels.saturating_sub(1);
+    net.my_locked_card = None;
     if run.pending_levels > 0 {
         roll_and_broadcast_offers(run, net, rng, offer);
     } else {
@@ -1462,10 +1470,12 @@ pub(super) fn pick(
             }
         }
         NetRole::Host => {
+            net.my_locked_card = Some(i);
             let local_id = net.local_id;
             apply_player_card_pick(local_id, i, run, net, offer, rng, next);
         }
         NetRole::Client => {
+            net.my_locked_card = Some(i);
             if !net.levelup_picked.contains(&net.local_id) {
                 net.levelup_picked.push(net.local_id);
                 if let Some(client) = &net.client {
@@ -1767,6 +1777,7 @@ pub(super) fn refresh_hud(
     phase: Res<State<Phase>>,
     mut run: ResMut<Run>,
     selection: Res<Selection>,
+    net: Res<NetSession>,
     font: Res<HudFont>,
     mut texts: ParamSet<(
         Query<&mut Text, With<LevelText>>,
@@ -1820,6 +1831,10 @@ pub(super) fn refresh_hud(
     // The picker owns the screen: an announcement waits until it closes.
     let banner = if *phase.get() == Phase::LevelUp {
         String::new()
+    } else if net.is_online() && !net.all_loaded {
+        let loaded = net.loaded_players.len().max(1);
+        let total = net.lobby_players.len().max(1);
+        format!("Waiting for party to finish loading ({loaded}/{total})...")
     } else {
         banner
     };

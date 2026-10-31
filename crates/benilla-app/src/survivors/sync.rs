@@ -133,6 +133,7 @@ pub(super) fn poll_network(
     mut net: ResMut<NetSession>,
     mut offer: ResMut<Offer>,
     mut rng: ResMut<Rng>,
+    loading: Res<crate::loading_screen::LoadingScreen>,
     world: WorldPoint,
     mut party_heroes: Query<(
         Entity,
@@ -281,6 +282,16 @@ pub(super) fn poll_network(
                             super::net::MAX_PLAYERS
                         );
                         if let Some(host) = &net.host {
+                            let token = host.peer_token(pid).unwrap_or(0);
+                            host.send_to(
+                                pid,
+                                &ReliableMsg::Welcome {
+                                    player_id: pid,
+                                    token,
+                                    map: selection.map,
+                                    players: net.lobby_players.clone(),
+                                },
+                            );
                             host.broadcast_reliable(&ReliableMsg::LobbyState {
                                 map: selection.map,
                                 players: net.lobby_players.clone(),
@@ -375,6 +386,20 @@ pub(super) fn poll_network(
                             NetPhase::GameOver => next.set(Phase::GameOver),
                         }
                     }
+                    ReliableMsg::ClientLoaded => {
+                        net.loaded_players.insert(pid);
+                        info!("multiplayer host: player {pid} reported map loaded");
+                        let total = net.lobby_players.len();
+                        if !net.all_loaded
+                            && net.lobby_players.iter().all(|p| net.loaded_players.contains(&p.id))
+                        {
+                            net.all_loaded = true;
+                            info!("multiplayer host: all {total} player(s) loaded! Starting simulation.");
+                            if let Some(host) = &net.host {
+                                host.broadcast_reliable(&ReliableMsg::AllLoaded);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -395,6 +420,21 @@ pub(super) fn poll_network(
 
             // Drive remote PartyHero entities on the Host
             if *phase.get() == Phase::Playing {
+                // Check host's local loading readiness
+                if !loading.covering() && net.loaded_players.insert(0) {
+                    info!("multiplayer host: local host player 0 finished loading");
+                    let total = net.lobby_players.len();
+                    if !net.all_loaded
+                        && net.lobby_players.iter().all(|p| net.loaded_players.contains(&p.id))
+                    {
+                        net.all_loaded = true;
+                        info!("multiplayer host: all {total} player(s) loaded! Starting simulation.");
+                        if let Some(host) = &net.host {
+                            host.broadcast_reliable(&ReliableMsg::AllLoaded);
+                        }
+                    }
+                }
+
                 let dt = time.delta_secs();
                 let map = selection.map_def();
                 let center = hero::arena(map);
@@ -570,7 +610,15 @@ pub(super) fn poll_network(
                         net.client_totems.clear();
                         net.latest_snap = None;
                         net.last_fx_seq_seen = 0;
+                        net.all_loaded = false;
+                        net.sent_loaded = false;
+                        net.loaded_players.clear();
+                        net.my_locked_card = None;
                         next.set(Phase::Playing);
+                    }
+                    ReliableMsg::AllLoaded => {
+                        net.all_loaded = true;
+                        info!("multiplayer client: all players finished loading! Match starting.");
                     }
                     ReliableMsg::LevelUpOffer {
                         level,
@@ -579,6 +627,7 @@ pub(super) fn poll_network(
                     } => {
                         run.level = level;
                         net.levelup_picked = picked;
+                        net.my_locked_card = None;
                         let local_id = net.local_id;
                         run.sync_combatant_from_local(local_id);
                         if let (Some(wires), Some(c)) =
@@ -623,6 +672,7 @@ pub(super) fn poll_network(
                         run.version = run.version.wrapping_add(1);
                         offer.set_choices(Vec::new());
                         net.levelup_picked.clear();
+                        net.my_locked_card = None;
                         next.set(Phase::Playing);
                     }
                     ReliableMsg::SetPhase {
@@ -655,6 +705,15 @@ pub(super) fn poll_network(
                         sex: lp.sex,
                         ready: net.local_ready,
                     });
+                }
+            }
+
+            // Notify Host when client has finished local loading
+            if *phase.get() == Phase::Playing && !loading.covering() && !net.sent_loaded {
+                net.sent_loaded = true;
+                if let Some(client) = &net.client {
+                    client.send_reliable(&ReliableMsg::ClientLoaded);
+                    info!("multiplayer client: sent ClientLoaded to host");
                 }
             }
         }

@@ -89,8 +89,10 @@ impl Plugin for SurvivorsPlugin {
                     .chain()
                     .after(WorldStage::Input)
                     .run_if(in_state(Phase::Playing))
-                    // Entering a battleground raises its loading screen: the run waits behind it.
-                    .run_if(|l: Res<crate::loading_screen::LoadingScreen>| !l.covering()),
+                    // Wait until local loading is cleared and all connected multiplayer peers are loaded.
+                    .run_if(|net: Res<NetSession>, l: Res<crate::loading_screen::LoadingScreen>| {
+                        !l.covering() && (!net.is_online() || net.all_loaded)
+                    }),
             )
             .add_systems(
                 Update,

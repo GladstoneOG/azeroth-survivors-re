@@ -404,6 +404,7 @@ pub(super) fn animate_cards(
         &mut UiTransform,
         &mut BoxShadow,
         &mut Visibility,
+        &mut BorderColor,
     )>,
     mut shines: Query<(&CardShine, &mut Node)>,
     mut rays: Query<&mut UiTransform, (With<Rays>, Without<Card>)>,
@@ -442,10 +443,11 @@ pub(super) fn animate_cards(
         r.rotation = Rot2::radians(now * 0.12);
         r.scale = Vec2::splat(1.0 + 0.03 * (now * 1.7).sin());
     }
-    let already_picked = net.is_online() && net.levelup_picked.contains(&net.local_id);
-    let chosen = pending.0.map(|(i, _)| i);
+    let already_picked =
+        net.is_online() && (net.levelup_picked.contains(&net.local_id) || net.my_locked_card.is_some());
+    let chosen = pending.0.map(|(i, _)| i).or(net.my_locked_card);
     let mut shine_at = [None::<f32>; 4];
-    for (mut card, interaction, cursor, mut tf, mut shadow, mut vis) in &mut cards {
+    for (mut card, interaction, cursor, mut tf, mut shadow, mut vis, mut border) in &mut cards {
         let card = &mut *card;
         card.t += dt;
         if card.t < 0.0 {
@@ -473,19 +475,24 @@ pub(super) fn animate_cards(
         let tl = card.tilt;
         card.tilt = tl + (want_tilt - tl) * k;
         let h = card.hover;
-        // The pick: the chosen card swells and rises, the others drop away.
+        // The pick: the chosen card swells and rises, the others drop away / grey out.
         let (pick_scale, pick_y, pick_fade) = match (chosen, card.picked) {
             (Some(c), _) if c == card.index => {
                 let p = card.picked.get_or_insert(0.0);
                 *p += dt;
                 let u = (*p / PICK_SECS).clamp(0.0, 1.0);
-                (1.0 + 0.18 * u, -30.0 * u, 0.0)
+                (1.0 + 0.12 * u, -26.0 * u, 0.0)
             }
             (Some(_), _) => {
                 let p = card.picked.get_or_insert(0.0);
                 *p += dt;
                 let u = (*p / PICK_SECS).clamp(0.0, 1.0);
-                (1.0 - 0.15 * u, 140.0 * u * u, u)
+                if net.is_online() {
+                    // In multiplayer, unchosen cards stay visible but sink down and grey out
+                    (1.0 - 0.08 * u, 24.0 * u, 0.7 * u)
+                } else {
+                    (1.0 - 0.15 * u, 140.0 * u * u, u)
+                }
             }
             _ => (1.0, 0.0, 0.0),
         };
@@ -501,11 +508,36 @@ pub(super) fn animate_cards(
         tf.scale = Vec2::new(s * squash, s * (1.0 + card.tilt.y.abs() * 0.02));
         tf.rotation = Rot2::degrees((1.0 - e) * -14.0 + lean);
         let rc = card.rarity.color();
-        if let Some(sh) = shadow.0.first_mut() {
-            sh.color = rc.with_alpha((0.25 + 0.6 * h) * (1.0 - pick_fade));
-            sh.blur_radius = Val::Px(18.0 + 22.0 * h);
-            sh.spread_radius = Val::Px(2.0 + 4.0 * h);
-            sh.y_offset = Val::Px(6.0 + 10.0 * h);
+        if let Some(c) = chosen {
+            if c == card.index {
+                // Highlighted locked card: radiant gold border and glowing aura
+                let gold = Color::srgb(1.0, 0.85, 0.2);
+                *border = BorderColor::all(gold);
+                if let Some(sh) = shadow.0.first_mut() {
+                    sh.color = gold.with_alpha(0.85);
+                    sh.blur_radius = Val::Px(24.0);
+                    sh.spread_radius = Val::Px(4.0);
+                    sh.y_offset = Val::Px(4.0);
+                }
+            } else {
+                // Unselected cards: dimmed grey border and subtle shadow
+                let dim_grey = Color::srgba(0.25, 0.25, 0.28, 0.35);
+                *border = BorderColor::all(dim_grey);
+                if let Some(sh) = shadow.0.first_mut() {
+                    sh.color = Color::srgba(0.0, 0.0, 0.0, 0.15);
+                    sh.blur_radius = Val::Px(4.0);
+                    sh.spread_radius = Val::Px(0.0);
+                    sh.y_offset = Val::Px(2.0);
+                }
+            }
+        } else {
+            *border = BorderColor::all(rc);
+            if let Some(sh) = shadow.0.first_mut() {
+                sh.color = rc.with_alpha((0.25 + 0.6 * h) * (1.0 - pick_fade));
+                sh.blur_radius = Val::Px(18.0 + 22.0 * h);
+                sh.spread_radius = Val::Px(2.0 + 4.0 * h);
+                sh.y_offset = Val::Px(6.0 + 10.0 * h);
+            }
         }
         if pick_fade >= 1.0 {
             *vis = Visibility::Hidden;
@@ -542,6 +574,7 @@ pub(super) fn choose_card(
 ) {
     if *phase.get() != Phase::LevelUp
         || pending.0.is_some()
+        || net.my_locked_card.is_some()
         || (net.is_online() && net.levelup_picked.contains(&net.local_id))
     {
         return;

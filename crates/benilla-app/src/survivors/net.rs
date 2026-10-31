@@ -8,7 +8,7 @@
 //!   velocities, HP/shields, Enemy positions/animations/HP, Gems, and Spell Visual FX triggers) and
 //!   60 Hz client input packets (WASD direction, yaw, jump, mobility cast).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -102,6 +102,10 @@ pub enum ReliableMsg {
         seed: u64,
         players: Vec<LobbyPlayer>,
     },
+    /// Client -> Server: Local map loading completed, ready to simulate.
+    ClientLoaded,
+    /// Server -> All Clients: All players have loaded, start simulation.
+    AllLoaded,
     /// Server -> All Clients: Simultaneous team level-up pause, with each player's 3 card offers.
     LevelUpOffer {
         level: u32,
@@ -471,6 +475,11 @@ impl HostTransport {
         }
     }
 
+    pub fn peer_token(&self, player_id: PlayerId) -> Option<u64> {
+        let guard = self.shared.lock().unwrap();
+        guard.peers.iter().find(|p| p.id == player_id).map(|p| p.token)
+    }
+
     pub fn broadcast_reliable(&self, msg: &ReliableMsg) {
         let mut guard = self.shared.lock().unwrap();
         for peer in &mut guard.peers {
@@ -681,6 +690,17 @@ pub struct NetSession {
     pub remote_mobility_requests: Vec<(PlayerId, Option<Vec3>)>,
     /// Queued jump triggers from remote clients on Host.
     pub remote_jump_requests: Vec<PlayerId>,
+    /// Whether all connected party members have finished loading the zone map and assets.
+    /// When false in multiplayer, the match simulation and timers stay paused at 00:00.
+    pub all_loaded: bool,
+    /// Player IDs who have finished local zone loading on the Host.
+    pub loaded_players: HashSet<PlayerId>,
+    /// Whether the local client has sent `ClientLoaded` to the host.
+    pub sent_loaded: bool,
+    /// The index of the card this local player has locked in during `Phase::LevelUp`.
+    /// When Some(idx), card `idx` remains elevated and highlighted with a gold border,
+    /// while unselected cards are greyed out.
+    pub my_locked_card: Option<usize>,
     /// True when running as a headless dedicated server (`--server` / `WOW_SURVIVORS_SERVER`).
     pub headless: bool,
 }
@@ -723,6 +743,10 @@ impl Default for NetSession {
             remote_inputs: HashMap::new(),
             remote_mobility_requests: Vec::new(),
             remote_jump_requests: Vec::new(),
+            all_loaded: true,
+            loaded_players: HashSet::new(),
+            sent_loaded: false,
+            my_locked_card: None,
             headless: false,
         }
     }
@@ -805,6 +829,10 @@ impl NetSession {
         self.remote_inputs.clear();
         self.remote_mobility_requests.clear();
         self.remote_jump_requests.clear();
+        self.all_loaded = true;
+        self.loaded_players.clear();
+        self.sent_loaded = false;
+        self.my_locked_card = None;
         self.latest_snap = None;
         self.status_text = "Singleplayer / Offline".into();
     }

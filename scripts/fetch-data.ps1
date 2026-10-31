@@ -18,16 +18,62 @@ if (-not (Test-Path $targetDir)) {
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 }
 
-$url = "https://archive.org/download/WoW_1.12.1-5875/1.12.1-5875_enUS.zip"
-if ($env:WOW_DATA_URL) {
-    $url = $env:WOW_DATA_URL
+$defaultDirectUrl = "https://ia600708.us.archive.org/32/items/WoW_1.12.1-5875/1.12.1-5875_enUS.zip"
+$backupUrl = "https://archive.org/download/WoW_1.12.1-5875/1.12.1-5875_enUS.zip"
+$url = if ($env:WOW_DATA_URL) { $env:WOW_DATA_URL } else { $defaultDirectUrl }
+$zipName = "1.12.1-5875_enUS.zip"
+$zipFile = Join-Path $targetDir $zipName
+
+# Check for aria2c for fast multi-connection concurrent download (IDM-style acceleration)
+$aria2 = $null
+$localAria2 = Join-Path $PSScriptRoot "aria2c.exe"
+if (Test-Path $localAria2) {
+    $aria2 = $localAria2
+} else {
+    $ariaCmd = Get-Command aria2c.exe -ErrorAction SilentlyContinue
+    if ($ariaCmd) {
+        $aria2 = $ariaCmd.Source
+    }
 }
-$zipFile = Join-Path $targetDir "1.12.1-5875_enUS.zip"
 
-Write-Host "Downloading WoW 1.12.1 client (~5.1 GB) from $url..." -ForegroundColor Cyan
-& curl.exe -L -C - --retry 3 -o $zipFile $url
+# If aria2c is not found, try quickly downloading portable aria2c (~2.4 MB)
+if (-not $aria2) {
+    try {
+        Write-Host "Fetching fast multi-connection downloader (aria2c)..." -ForegroundColor Cyan
+        $ariaZip = Join-Path $targetDir "aria2_temp.zip"
+        & curl.exe -sL -o $ariaZip "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+        if (Test-Path $ariaZip) {
+            & tar.exe -xf $ariaZip -C $targetDir --strip-components=1 "*aria2c.exe"
+            Remove-Item $ariaZip -Force -ErrorAction SilentlyContinue
+            $extractedAria = Join-Path $targetDir "aria2c.exe"
+            if (Test-Path $extractedAria) {
+                Move-Item $extractedAria $localAria2 -Force -ErrorAction SilentlyContinue
+                if (Test-Path $localAria2) {
+                    $aria2 = $localAria2
+                } else {
+                    $aria2 = $extractedAria
+                }
+            }
+        }
+    } catch {
+        # Fallback to curl if download fails
+    }
+}
 
-if ($LASTEXITCODE -ne 0) {
+if ($aria2) {
+    Write-Host "Downloading WoW 1.12.1 client (~5.1 GB) using 16 concurrent connections (IDM-style acceleration)..." -ForegroundColor Cyan
+    Write-Host "Source: $url" -ForegroundColor DarkCyan
+    & $aria2 -c -x 16 -s 16 -k 1M --file-allocation=none --summary-interval=2 -d $targetDir -o $zipName $url
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "aria2 download returned code $LASTEXITCODE. Retrying with curl.exe..."
+        & curl.exe -L -C - --retry 3 -o $zipFile $url
+    }
+} else {
+    Write-Host "Downloading WoW 1.12.1 client (~5.1 GB) from $url..." -ForegroundColor Cyan
+    & curl.exe -L -C - --retry 3 -o $zipFile $url
+}
+
+if ($LASTEXITCODE -ne 0 -and -not (Test-Path $zipFile)) {
     Write-Host "Download failed or interrupted with exit code $LASTEXITCODE." -ForegroundColor Red
     exit $LASTEXITCODE
 }
@@ -105,6 +151,8 @@ if (-not (Test-Path "$dataTarget\terrain.MPQ")) {
 if ((Test-Path "$dataTarget\terrain.MPQ") -and (Test-Path "$dataTarget\patch.MPQ")) {
     Write-Host "Extraction verified! Removing temporary zip file to save ~5 GB disk space..." -ForegroundColor Green
     Remove-Item -Path $zipFile -Force -ErrorAction SilentlyContinue
+    # Also clean up aria2 control file if left behind
+    Remove-Item -Path "$zipFile.aria2" -Force -ErrorAction SilentlyContinue
 
     # Optional: Create junction link 'Data' in project root if it does not already exist
     $rootData = Join-Path $root "Data"

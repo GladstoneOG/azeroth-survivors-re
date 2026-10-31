@@ -329,7 +329,7 @@ fn lobby_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
             .with_children(|top| {
                 top.spawn(text_bundle(
                     f,
-                    "LAN / ZeroTier / Tailscale Co-op",
+                    "Local Co-op",
                     14.0,
                     GOLD,
                 ));
@@ -1108,7 +1108,7 @@ pub(super) fn refresh_menu_ui(
         let i = slot.0;
         if !net.is_online() {
             let want = if i == 0 {
-                "Solo Mode — Click 'Host LAN' to host or enter ZeroTier/Tailscale IP & 'Join IP'"
+                "Solo Mode — Click 'Host LAN' to host or enter IP & 'Join IP'"
                     .to_string()
             } else {
                 String::new()
